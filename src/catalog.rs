@@ -32,6 +32,10 @@ pub struct IndexProgress {
 }
 
 impl IndexProgress {
+    pub fn cancel(&self) {
+        self.walk.cancelled.store(true, AtomicOrdering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> ProgressSnapshot {
         ProgressSnapshot {
             entries: self.walk.entries.load(AtomicOrdering::Relaxed),

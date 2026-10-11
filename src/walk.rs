@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::sync::mpsc;
 use std::thread;
@@ -17,6 +17,7 @@ pub struct Progress {
     pub entries: AtomicUsize,
     pub directories: AtomicUsize,
     pub skipped: AtomicUsize,
+    pub cancelled: AtomicBool,
 }
 
 struct Work {
@@ -80,6 +81,7 @@ pub fn scan_with_progress(
                     };
                     let mut entries = Vec::new();
                     let result = list_directory(&dir, |path, directory, reparse| {
+                        if progress.cancelled.load(Ordering::Relaxed) { return Ok(false); }
                         entries.push((path, directory, reparse));
                         Ok(true)
                     });
@@ -111,6 +113,10 @@ pub fn scan_with_progress(
         let mut summary = ScanSummary::default();
         let mut error = None;
         for batch in rx.iter() {
+            if progress.cancelled.load(Ordering::Relaxed) {
+                error = Some(io::Error::new(io::ErrorKind::Interrupted, "indexing cancelled"));
+                break;
+            }
             summary.directories += 1;
             progress.directories.fetch_add(1, Ordering::Relaxed);
             if batch.skipped {
