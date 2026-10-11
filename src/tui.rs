@@ -6,6 +6,7 @@
 use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, IndexProgress, ScanSummary};
 use std::sync::{Arc, mpsc};
 use crate::console::Terminal;
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -16,8 +17,6 @@ const GREY: &str = "\x1b[90m";
 const BLUE: &str = "\x1b[94m";
 const BOLD: &str = "\x1b[1m";
 const BG: &str = "\x1b[48;2;19;19;19m";
-const KEY_EVENT: u16 = 1;
-const RESIZE_EVENT: u16 = 4;
 
 pub fn run(roots: Vec<PathBuf>, force_refresh: bool) -> io::Result<()> {
     let terminal = Terminal::enter()?;
@@ -80,7 +79,6 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
     let mut summary = catalog.summary();
     let mut worker = start_search_worker(catalog);
     let mut selected = 0usize;
-    let mut pending_high_surrogate = None;
     let mut elapsed = Duration::ZERO;
     let mut hits: Vec<String> = Vec::new();
     let mut generation = 0u64;
@@ -109,38 +107,36 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
         }
 
         let Some(event) = term.read_timeout(65)? else { continue };
-        if event.event_type == RESIZE_EVENT {
-            redraw = true;
+        let Event::Key(event) = event else {
+            if matches!(event, Event::Resize(..)) { redraw = true; }
             continue;
-        }
-        if event.event_type != KEY_EVENT || event.key.pressed == 0 {
-            continue;
-        }
+        };
+        if !matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) { continue; }
         let mut changed = false;
-        match event.key.virtual_key {
-            0x1B => {
+        match event.code {
+            KeyCode::Esc => {
                 worker.stop();
                 return Ok(());
             }
-            0x08 => {
+            KeyCode::Backspace => {
                 if query.pop().is_some() { changed = true; }
             }
-            0x26 => {
+            KeyCode::Up => {
                 selected = selected.saturating_sub(1);
                 redraw = true;
             }
-            0x28 => {
+            KeyCode::Down => {
                 selected = (selected + 1).min(hits.len().saturating_sub(1));
                 redraw = true;
             }
-            0x0D => {
+            KeyCode::Enter => {
                 if !pending {
                     if let Some(path) = hits.get(selected) {
                         let _ = reveal(path);
                     }
                 }
             }
-            0x52 if event.key.modifiers & 0x000c != 0 => {
+            KeyCode::Char('r' | 'R') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                 worker.stop(); // release the old file mapping before replacement
                 let Some((updated, from_disk)) = load_index(term, out, &roots, true, &mut query)? else {
                     return Ok(());
@@ -153,25 +149,10 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 selected = 0;
                 changed = true;
             }
-            _ => {
-                let unit = event.key.character;
-                if unit == 0 || unit < 0x20 { continue; }
-                if (0xD800..=0xDBFF).contains(&unit) {
-                    pending_high_surrogate = Some(unit);
-                    continue;
-                }
-                let character = if let Some(high) = pending_high_surrogate.take() {
-                    char::decode_utf16([high, unit]).next().and_then(Result::ok)
-                } else {
-                    char::from_u32(u32::from(unit))
-                };
-                if let Some(character) = character {
-                    if query.chars().count() < 160 {
-                        query.push(character);
-                        changed = true;
-                    }
-                }
+            KeyCode::Char(ch) if !event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                if query.chars().count() < 160 { query.push(ch); changed = true; }
             }
+            _ => {}
         }
         if changed {
             generation += 1;
@@ -215,7 +196,6 @@ fn load_index(
     });
 
     let mut last = String::new();
-    let mut pending_high = None;
     loop {
         match rx.try_recv() {
             Ok(Ok(result)) => return Ok(Some(result)),
@@ -244,34 +224,20 @@ fn load_index(
             show_message(term, out, &label)?;
             last = label;
         }
-        let Some(event) = term.read_timeout(150)? else { continue };
-        if event.event_type != KEY_EVENT || event.key.pressed == 0 { continue }
-        match event.key.virtual_key {
-            0x1B => {
+        let Some(Event::Key(key)) = term.read_timeout(150)? else { continue };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) { continue; }
+        match key.code {
+            KeyCode::Esc => {
                 progress.cancel();
-                // The worker completes its current directory, drops temporary
-                // files and exits. Keep the terminal responsive while waiting.
                 show_message(term, out, "Stopping index scan...")?;
                 let _ = rx.recv();
                 return Ok(None);
             }
-            0x08 => { query.pop(); }
-            _ => {
-                let unit = event.key.character;
-                if unit < 0x20 { continue }
-                if (0xD800..=0xDBFF).contains(&unit) {
-                    pending_high = Some(unit);
-                    continue;
-                }
-                let character = if let Some(high) = pending_high.take() {
-                    char::decode_utf16([high, unit]).next().and_then(Result::ok)
-                } else {
-                    char::from_u32(u32::from(unit))
-                };
-                if let Some(character) = character {
-                    if query.chars().count() < 160 { query.push(character); }
-                }
+            KeyCode::Backspace => { query.pop(); }
+            KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                if query.chars().count() < 160 { query.push(ch); }
             }
+            _ => {}
         }
     }
 }

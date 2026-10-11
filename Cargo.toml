@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT"
 description = "Lightweight native Windows file search"
 
+[dependencies]
+crossterm = "0.29"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
