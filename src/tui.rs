@@ -30,6 +30,11 @@ pub fn run(roots: Vec<PathBuf>, force_refresh: bool) -> io::Result<()> {
     result
 }
 
+#[derive(Default)]
+struct ScreenState {
+    size: Option<(usize, usize)>,
+}
+
 struct SearchResult {
     generation: u64,
     paths: Vec<String>,
@@ -94,6 +99,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
     let mut generation = 0u64;
     let mut pending = false;
     let mut redraw = true;
+    let mut screen_state = ScreenState::default();
 
     if !query.is_empty() {
         generation += 1;
@@ -114,7 +120,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
             redraw = true;
         }
         if redraw {
-            draw(term, out, &query, &hits, selected, elapsed, summary, cached, &roots, pending, accelerated, &history)?;
+            draw(term, out, &query, &hits, selected, elapsed, summary, cached, &roots, pending, accelerated, &history, &mut screen_state)?;
             redraw = false;
         }
 
@@ -293,6 +299,7 @@ fn draw(
     pending: bool,
     accelerated: bool,
     history: &LatencyHistory,
+    screen: &mut ScreenState,
 ) -> io::Result<()> {
     let (width, height) = term.dimensions();
     let width = width.min(240);
@@ -301,12 +308,18 @@ fn draw(
     let margin = if width > 70 { "    " } else { "  " };
     let count = number(info.entries);
     let mut buffer = String::new();
-    buffer.push_str("\x1b[H\x1b[2J");
-    // Paint entire viewport to give the terminal the same clean dark surface.
-    for line in 1..=height {
-        buffer.push_str(BG);
-        buffer.push_str("\x1b[2K");
-        if line < height { buffer.push('\n'); }
+    buffer.push_str("\x1b[?25l");
+    // The first frame and resizes paint the full dark surface. Subsequent
+    // keystrokes clear only the content region, not the whole terminal.
+    if screen.size.replace((width, height)) != Some((width, height)) {
+        buffer.push_str("\x1b[H\x1b[2J");
+        for line in 1..=height {
+            buffer.push_str(BG);
+            buffer.push_str("\x1b[2K");
+            if line < height { buffer.push('\n'); }
+        }
+    } else {
+        buffer.push_str(&format!("\x1b[3;1H{BG}\x1b[0J"));
     }
     buffer.push_str("\x1b[H");
     buffer.push_str(&format!("\n\n{margin}{BOLD}FSearch{RESET}{BG}    {GREY}{}  ·  {} files and folders{RESET}{BG}\n\n",
