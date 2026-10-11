@@ -8,6 +8,8 @@ use std::process::ExitCode;
 mod console;
 #[cfg(windows)]
 mod tui;
+#[cfg(windows)]
+mod latency;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
@@ -56,7 +58,7 @@ fn interactive_main(mut args: impl Iterator<Item = String>) -> ExitCode {
                 Err(error) => fail(&error.to_string()),
             };
         }
-        return match tui::run(roots, refresh) {
+        match tui::run(roots, refresh) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("fsearch: {error}");
@@ -64,7 +66,7 @@ fn interactive_main(mut args: impl Iterator<Item = String>) -> ExitCode {
                 let _ = std::io::stdin().read_line(&mut String::new());
                 ExitCode::FAILURE
             }
-        };
+        }
     }
 
     #[cfg(not(windows))]

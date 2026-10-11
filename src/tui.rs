@@ -5,7 +5,9 @@
 
 use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, IndexProgress, ScanSummary};
 use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::console::Terminal;
+use crate::latency::LatencyHistory;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -28,6 +30,11 @@ pub fn run(roots: Vec<PathBuf>, force_refresh: bool) -> io::Result<()> {
     result
 }
 
+#[derive(Default)]
+struct ScreenState {
+    size: Option<(usize, usize)>,
+}
+
 struct SearchResult {
     generation: u64,
     paths: Vec<String>,
@@ -38,11 +45,14 @@ struct SearchWorker {
     queries: mpsc::Sender<(u64, String, usize)>,
     results: mpsc::Receiver<SearchResult>,
     handle: std::thread::JoinHandle<()>,
+    newest: Arc<AtomicU64>,
 }
 
 fn start_search_worker(catalog: Catalog) -> SearchWorker {
     let (queries, rx) = mpsc::channel::<(u64, String, usize)>();
     let (tx, results) = mpsc::channel();
+    let newest = Arc::new(AtomicU64::new(0));
+    let worker_newest = Arc::clone(&newest);
     let handle = std::thread::spawn(move || {
         while let Ok(mut request) = rx.recv() {
             // Only the newest queued query matters while someone is typing.
@@ -50,8 +60,10 @@ fn start_search_worker(catalog: Catalog) -> SearchWorker {
                 request = next;
             }
             let started = Instant::now();
-            let paths = catalog.search(&request.1, request.2)
-                .into_iter().map(str::to_owned).collect();
+            let paths = catalog.search_with_cancel(&request.1, request.2, || {
+                worker_newest.load(Ordering::Relaxed) != request.0
+            }).into_iter().map(str::to_owned).collect();
+            if worker_newest.load(Ordering::Relaxed) != request.0 { continue; }
             if tx.send(SearchResult {
                 generation: request.0,
                 paths,
@@ -61,11 +73,12 @@ fn start_search_worker(catalog: Catalog) -> SearchWorker {
             }
         }
     });
-    SearchWorker { queries, results, handle }
+    SearchWorker { queries, results, handle, newest }
 }
 
 impl SearchWorker {
     fn stop(self) {
+        self.newest.store(u64::MAX, Ordering::Relaxed);
         drop(self.queries);
         let _ = self.handle.join();
     }
@@ -77,18 +90,22 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
         return Ok(());
     };
     let mut summary = catalog.summary();
+    let mut accelerated = catalog.accelerated();
     let mut worker = start_search_worker(catalog);
     let mut selected = 0usize;
     let mut elapsed = Duration::ZERO;
+    let mut history = LatencyHistory::new();
     let mut hits: Vec<String> = Vec::new();
     let mut generation = 0u64;
     let mut pending = false;
     let mut redraw = true;
+    let mut screen_state = ScreenState::default();
 
     if !query.is_empty() {
         generation += 1;
         let (_, height) = term.dimensions();
-        worker.queries.send((generation, query.clone(), height.saturating_sub(10).clamp(3, 50)))
+        worker.newest.store(generation, Ordering::Relaxed);
+        worker.queries.send((generation, query.clone(), result_limit(height)))
             .map_err(|_| io::Error::other("search worker stopped"))?;
         pending = true;
     }
@@ -96,17 +113,24 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
         while let Ok(found) = worker.results.try_recv() {
             if found.generation != generation { continue; }
             elapsed = found.elapsed;
+            if !query.is_empty() { history.push(found.elapsed); }
             hits = found.paths;
             selected = selected.min(hits.len().saturating_sub(1));
             pending = false;
             redraw = true;
         }
         if redraw {
-            draw(term, out, &query, &hits, selected, elapsed, summary, cached, &roots, pending)?;
+            draw(term, out, DrawModel {
+                query: &query, hits: &hits, selected, duration: elapsed,
+                info: summary, cached, roots: &roots, pending, accelerated,
+            }, &mut history, &mut screen_state)?;
             redraw = false;
         }
 
-        let Some(event) = term.read_timeout(65)? else { continue };
+        // Poll more frequently only while results are being calculated;
+        // otherwise sleep on the console event instead of waking constantly.
+        let wait_ms = if pending { 12 } else { 100 };
+        let Some(event) = term.read_timeout(wait_ms)? else { continue };
         let Event::Key(event) = event else {
             if matches!(event, Event::Resize(..)) { redraw = true; }
             continue;
@@ -130,10 +154,8 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 redraw = true;
             }
             KeyCode::Enter => {
-                if !pending {
-                    if let Some(path) = hits.get(selected) {
-                        let _ = reveal(path);
-                    }
+                if !pending && let Some(path) = hits.get(selected) {
+                    let _ = reveal(path);
                 }
             }
             KeyCode::Char('r' | 'R') if event.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -142,7 +164,11 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                     return Ok(());
                 };
                 summary = updated.summary();
+                accelerated = updated.accelerated();
                 cached = from_disk;
+                history.clear();
+                // The indexing screen replaced the alternate screen's header.
+                screen_state.size = None;
                 worker = start_search_worker(updated);
                 hits.clear();
                 pending = false;
@@ -163,7 +189,8 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 elapsed = Duration::ZERO;
             } else {
                 let (_, height) = term.dimensions();
-                worker.queries.send((generation, query.clone(), height.saturating_sub(10).clamp(3, 50)))
+                worker.newest.store(generation, Ordering::Relaxed);
+                worker.queries.send((generation, query.clone(), result_limit(height)))
                     .map_err(|_| io::Error::other("search worker stopped"))?;
                 pending = true;
             }
@@ -212,6 +239,7 @@ fn load_index(
             1 => "Scanning files",
             2 => "Saving index",
             3 => "Opening new index",
+            5 => "Preparing fast lookup",
             _ => "Finishing",
         };
         let label = format!(
@@ -255,62 +283,197 @@ fn apply_text_key(query: &mut String, event: &KeyEvent) -> bool {
     }
 }
 
-fn draw(
-    term: &Terminal,
-    out: &mut impl Write,
-    query: &str,
-    hits: &[String],
+/// Keep result rows clear of the footer and the latency history.
+fn result_limit(height: usize) -> usize {
+    if height >= 16 {
+        height.saturating_sub(13).clamp(3, 50)
+    } else {
+        height.saturating_sub(10).clamp(3, 50)
+    }
+}
+
+/// Everything needed to render one immutable search frame.
+#[derive(Clone, Copy)]
+struct DrawModel<'a> {
+    query: &'a str,
+    hits: &'a [String],
     selected: usize,
     duration: Duration,
     info: ScanSummary,
     cached: bool,
-    roots: &[PathBuf],
+    roots: &'a [PathBuf],
     pending: bool,
+    accelerated: bool,
+}
+
+fn draw(
+    term: &Terminal,
+    out: &mut impl Write,
+    frame: DrawModel<'_>,
+    history: &mut LatencyHistory,
+    screen: &mut ScreenState,
 ) -> io::Result<()> {
+    let DrawModel {
+        query, hits, selected, duration, info, cached, roots, pending, accelerated,
+    } = frame;
     let (width, height) = term.dimensions();
     let width = width.min(240);
-    let header = if roots.len() > 1 { "whole disk".to_string() }
-        else { roots.first().map(|p| p.display().to_string()).unwrap_or_default() };
     let margin = if width > 70 { "    " } else { "  " };
     let count = number(info.entries);
-    let mut buffer = String::new();
-    buffer.push_str("\x1b[H\x1b[2J");
-    // Paint entire viewport to give the terminal the same clean dark surface.
-    for line in 1..=height {
-        buffer.push_str(BG);
-        buffer.push_str("\x1b[2K");
-        if line < height { buffer.push('\n'); }
-    }
-    buffer.push_str("\x1b[H");
-    buffer.push_str(&format!("\n\n{margin}{BOLD}FSearch{RESET}{BG}    {GREY}{}  ·  {} files and folders{RESET}{BG}\n\n",
-        shorten(&header, width.saturating_sub(44)), count));
-    buffer.push_str(&format!("{margin}{BLUE}›{RESET}{BG} {BOLD}fsearch{RESET}{BG} {} {GREEN}{:0.2} ms{RESET}{BG}\n",
-        shorten(query, width.saturating_sub(33)), duration.as_secs_f64() * 1000.0));
-    let bar = "─".repeat(width.saturating_sub(margin.len() + 4));
-    buffer.push_str(&format!("{margin}{GREY}{bar}{RESET}{BG}\n"));
-    let max = height.saturating_sub(10);
-    for (i, path) in hits.iter().take(max).enumerate() {
-        let idx = path.rfind(['\\', '/']);
-        let name = idx.map_or(path.as_str(), |n| &path[n + 1..]);
-        let location = idx.map_or("", |n| &path[..n]);
-        let file = shorten(name, (width / 3).max(16));
-        let folder = shorten(location, width.saturating_sub(file.chars().count() + margin.len() + 6));
-        let marker = if i == selected { format!("{BLUE}›{RESET}{BG}") } else { " ".to_string() };
-        buffer.push_str(&format!("{margin}{marker} {BOLD}{file}{RESET}{BG}  {GREY}{folder}{RESET}{BG}\n"));
-    }
-    let partial = if info.truncated { "  ·  index incomplete (limit reached)" } else { "" };
-    let origin = if cached { "saved index" } else { "new index" };
-    let status = if pending {
-        format!("searching...  ·  {origin} · {count} entries · {} skipped{partial}", info.skipped)
+    let mut buffer = String::with_capacity(width.saturating_mul(height).min(20_000));
+    buffer.push_str("\x1b[?25l");
+
+    // Paint the full background only once or after a resize. Search changes
+    // leave the title alone and clear just the dynamic region below it.
+    let fresh = screen.size.replace((width, height)) != Some((width, height));
+    if fresh {
+        buffer.push_str("\x1b[H\x1b[2J");
+        for row in 1..=height {
+            buffer.push_str(&format!("\x1b[{row};1H{BG}\x1b[2K"));
+        }
+        let header = if roots.len() > 1 {
+            "whole disk".to_string()
+        } else {
+            roots.first().map(|p| p.display().to_string()).unwrap_or_default()
+        };
+        let header_info = if width >= 68 {
+            format!("    {}  ·  {count} files and folders", shorten(&header, width - 44))
+        } else if width >= 40 {
+            format!("    {count} entries")
+        } else {
+            String::new()
+        };
+        buffer.push_str(&format!(
+            "\x1b[3;{}H{BOLD}FSearch{RESET}{BG}{GREY}{}{RESET}{BG}",
+            margin.len() + 1, header_info,
+        ));
     } else {
-        format!("{origin} · {count} entries · {} skipped{partial}", info.skipped)
+        buffer.push_str(&format!("\x1b[5;1H{BG}\x1b[0J"));
+    }
+
+    let latency = if query.is_empty() {
+        "— ms".to_string()
+    } else if pending {
+        "searching…".to_string()
+    } else {
+        format!("{:.2} ms", duration.as_secs_f64() * 1000.0)
     };
-    let foot = "↑↓ select   Enter reveal   Ctrl+R reindex   Esc quit";
-    buffer.push_str(&format!("\x1b[{};1H{margin}{GREY}{}{RESET}{BG}", height.saturating_sub(2), shorten(&status, width.saturating_sub(margin.len() + 1))));
-    buffer.push_str(&format!("\x1b[{};1H{margin}{GREY}{}{RESET}{BG}", height.saturating_sub(1), shorten(foot, width.saturating_sub(margin.len() + 1))));
-    buffer.push_str(&format!("\x1b[5;{}H\x1b[?25h", margin.len() + 11 + query.chars().count()));
+    let latency_col = right_align_col(width, latency.chars().count(), margin.len());
+    let query_col = margin.len() + 11; // › fsearch followed by one space
+    let available = latency_col.saturating_sub(query_col + 2);
+    let visible = query_tail(query, available);
+    let color = if pending || query.is_empty() { GREY } else { GREEN };
+    buffer.push_str(&format!(
+        "\x1b[5;{}H{BLUE}›{RESET}{BG} {BOLD}fsearch{RESET}{BG} {}",
+        margin.len() + 1, visible,
+    ));
+    buffer.push_str(&format!(
+        "\x1b[5;{latency_col}H{color}{latency}{RESET}{BG}",
+    ));
+
+    let bar = "─".repeat(width.saturating_sub(margin.len() + 4));
+    buffer.push_str(&format!("\x1b[6;{}H{GREY}{bar}{RESET}{BG}", margin.len() + 1));
+    for (index, path) in hits.iter().take(result_limit(height)).enumerate() {
+        let split = path.rfind(['\\', '/']);
+        let name = split.map_or(path.as_str(), |i| &path[i + 1..]);
+        let folder = split.map_or("", |i| &path[..i]);
+        let name = shorten(name, (width / 3).max(16));
+        let location = shorten(
+            folder,
+            width.saturating_sub(name.chars().count() + margin.len() + 6),
+        );
+        let marker = if index == selected { BLUE } else { GREY };
+        let symbol = if index == selected { "›" } else { " " };
+        buffer.push_str(&format!(
+            "\x1b[{};{}H{marker}{symbol}{RESET}{BG} {BOLD}{name}{RESET}{BG}  {GREY}{location}{RESET}{BG}",
+            index + 7, margin.len() + 1,
+        ));
+    }
+
+    // The graph matches the original terminal demo: a green waveform and a
+    // median. On wide screens it shares one row with the caption. On smaller
+    // screens it stacks or drops the caption before touching result space.
+    if height >= 16 {
+        let caption = "every keystroke is a whole-disk search";
+        let median = history.median_ms();
+        let median_label = median.map_or_else(
+            || "median — ms".to_string(),
+            |ms| format!("median {ms:.1} ms"),
+        );
+        let median_col = right_align_col(width, median_label.chars().count(), margin.len());
+        let wide = width >= 100;
+        let chart_row = height - 4;
+        if wide {
+            buffer.push_str(&format!(
+                "\x1b[{chart_row};{}H{GREY}{caption}{RESET}{BG}",
+                margin.len() + 1,
+            ));
+        } else if width >= 70 {
+            buffer.push_str(&format!(
+                "\x1b[{};{}H{GREY}{caption}{RESET}{BG}",
+                height - 5, margin.len() + 1,
+            ));
+        }
+        let chart_col = if wide {
+            margin.len() + caption.len() + 4
+        } else {
+            margin.len() + 1
+        };
+        let chart_width = median_col.saturating_sub(chart_col + 3).min(32);
+        if chart_width >= 2 {
+            let empty = history.is_empty();
+            let graph = history.sparkline(chart_width);
+            let graph = if empty { "▁" } else { graph };
+            buffer.push_str(&format!(
+                "\x1b[{chart_row};{chart_col}H{GREEN}{graph}{RESET}{BG}",
+            ));
+        }
+        buffer.push_str(&format!(
+            "\x1b[{chart_row};{median_col}H{GREY}median {GREEN}{}{RESET}{BG}",
+            median.map_or_else(|| "— ms".to_string(), |ms| format!("{ms:.1} ms")),
+        ));
+    }
+
+    let partial = if info.truncated { " · index incomplete" } else { "" };
+    let source = if cached { "saved index" } else { "new index" };
+    let mode = if accelerated { "fast lookup" } else { "scan fallback" };
+    let status = if pending {
+        format!("searching... · {source} · {mode} · {count} entries · {} skipped{partial}", info.skipped)
+    } else {
+        format!("{source} · {mode} · {count} entries · {} skipped{partial}", info.skipped)
+    };
+    let help = "↑↓ select   Enter reveal   Ctrl+R reindex   Esc quit";
+    buffer.push_str(&format!(
+        "\x1b[{};{}H{GREY}{}{RESET}{BG}",
+        height - 2, margin.len() + 1,
+        shorten(&status, width.saturating_sub(margin.len() + 2)),
+    ));
+    buffer.push_str(&format!(
+        "\x1b[{};{}H{GREY}{}{RESET}{BG}",
+        height - 1, margin.len() + 1,
+        shorten(help, width.saturating_sub(margin.len() + 2)),
+    ));
+    let cursor_col = (query_col + visible.chars().count()).min(latency_col.saturating_sub(1));
+    buffer.push_str(&format!("\x1b[5;{cursor_col}H\x1b[?25h"));
     out.write_all(buffer.as_bytes())?;
     out.flush()
+}
+
+fn right_align_col(width: usize, text_len: usize, right_margin: usize) -> usize {
+    width.saturating_sub(text_len + right_margin).saturating_add(1).max(1)
+}
+
+/// Keep the end of long queries visible while the right-aligned ms stays put.
+fn query_tail(query: &str, width: usize) -> String {
+    if width == 0 { return String::new(); }
+    let length = query.chars().count();
+    if length <= width { return query.to_string(); }
+    if width == 1 { return "…".to_string(); }
+    let skip = length - width + 1;
+    let mut visible = String::with_capacity(width * 3);
+    visible.push('…');
+    visible.extend(query.chars().skip(skip));
+    visible
 }
 
 fn show_message(term: &Terminal, out: &mut impl Write, message: &str) -> io::Result<()> {
@@ -365,6 +528,23 @@ mod tests {
         assert_eq!(query, "m");
         assert!(!apply_text_key(&mut query, &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)));
         assert_eq!(query, "m");
+    }
+
+    #[test]
+    fn latency_graph_reserves_space_for_results() {
+        assert_eq!(result_limit(30), 17);
+        assert_eq!(result_limit(16), 3);
+        assert_eq!(result_limit(12), 3);
+        assert_eq!(result_limit(100), 50);
+    }
+
+    #[test]
+    fn aligns_latency_without_overlapping_query() {
+        assert_eq!(right_align_col(120, 8, 4), 109);
+        assert_eq!(right_align_col(40, 8, 2), 31);
+        assert_eq!(query_tail("minecraft", 5), "…raft");
+        assert_eq!(query_tail("meow", 5), "meow");
+        assert_eq!(query_tail("hello", 0), "");
     }
 
     #[test]

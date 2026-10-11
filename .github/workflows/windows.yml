@@ -3,6 +3,8 @@ name: Windows build
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -16,8 +18,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
         run: cargo test --all-targets
+      - name: Rust lint
+        run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --release
+      - name: Search benchmark
+        run: cargo test --release --lib benchmark_search -- --ignored --nocapture
       - name: Test command line
         shell: pwsh
         run: |

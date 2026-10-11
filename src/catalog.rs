@@ -3,12 +3,12 @@
 //! One compact file contains a header, the indexed roots, path offsets, and
 //! UTF-8 paths. Searches read directly from a read-only memory map.
 
-use crate::{mapped::MappedFile, walk};
+use crate::{mapped::MappedFile, walk, lookup::Lookup};
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"FSWIN003";
@@ -36,6 +36,10 @@ impl IndexProgress {
         self.walk.cancelled.store(true, AtomicOrdering::Relaxed);
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.walk.cancelled.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> ProgressSnapshot {
         ProgressSnapshot {
             entries: self.walk.entries.load(AtomicOrdering::Relaxed),
@@ -51,7 +55,7 @@ pub struct ProgressSnapshot {
     pub entries: usize,
     pub directories: usize,
     pub skipped: usize,
-    /// 0: opening, 1: scanning, 2: saving, 3: loading, 4: complete
+    /// 0: opening, 1: scanning, 2: saving, 3: loading, 4: complete, 5: building lookup
     pub phase: u8,
 }
 
@@ -61,6 +65,7 @@ pub struct Catalog {
     offsets: usize,
     masks: usize,
     paths: usize,
+    lookup: Option<Lookup>,
     summary: ScanSummary,
 }
 
@@ -86,18 +91,18 @@ impl Catalog {
         let roots = normalize_roots(roots)?;
         let key = roots_key(&roots);
         let file = index_path(&key);
-        if !refresh {
-            if let Ok(index) = Self::load(&file, &key) {
-                if index.summary.entries <= limit && !(index.summary.truncated && index.summary.entries < limit) {
-                    progress.phase.store(4, AtomicOrdering::Relaxed);
-                    return Ok((index, true));
-                }
-            }
+        if !refresh
+            && let Ok(index) = Self::load_with_progress(&file, &key, Some(progress))
+            && index.summary.entries <= limit
+            && !(index.summary.truncated && index.summary.entries < limit)
+        {
+            progress.phase.store(4, AtomicOrdering::Relaxed);
+            return Ok((index, true));
         }
         progress.phase.store(1, AtomicOrdering::Relaxed);
         Self::build_to_path(&roots, &file, limit, progress)?;
         progress.phase.store(3, AtomicOrdering::Relaxed);
-        let index = Self::load(&file, &key)?;
+        let index = Self::load_with_progress(&file, &key, Some(progress))?;
         progress.phase.store(4, AtomicOrdering::Relaxed);
         Ok((index, false))
     }
@@ -107,7 +112,14 @@ impl Catalog {
         Self::open_or_build(&[root.to_path_buf()], limit, true).map(|(index, _)| index)
     }
 
+    #[cfg(test)]
     fn load(file: &Path, expected_roots: &str) -> io::Result<Self> {
+        Self::load_with_progress(file, expected_roots, None)
+    }
+
+    fn load_with_progress(
+        file: &Path, expected_roots: &str, progress: Option<&IndexProgress>,
+    ) -> io::Result<Self> {
         let mapped = MappedFile::open(file)?;
         let b = mapped.bytes();
         if b.len() < HEADER || &b[..8] != MAGIC {
@@ -143,10 +155,26 @@ impl Catalog {
         if word(b, offsets) != Some(0) || previous != data_size {
             return Err(invalid("incomplete index"));
         }
-        Ok(Self {
-            mapped, count, offsets, masks, paths,
+        let mut catalog = Self {
+            mapped, count, offsets, masks, paths, lookup: None,
             summary: ScanSummary { entries: count, directories, skipped, truncated },
-        })
+        };
+        // A missing or corrupt accelerator must never make the working name
+        // catalog unavailable. Queries can fall back to the original scan.
+        match Lookup::open_or_build(file, count, |id| {
+            catalog.path_at(id).map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p))
+        }, || {
+            if let Some(progress) = progress {
+                progress.phase.store(5, AtomicOrdering::Relaxed);
+            }
+        }, || progress.is_some_and(IndexProgress::is_cancelled)) {
+            Ok(lookup) => catalog.lookup = Some(lookup),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+            // Missing disk space or an invalid optional lookup must not
+            // prevent searching the already validated file catalog.
+            Err(_) => {}
+        }
+        Ok(catalog)
     }
 
     fn build_to_path(roots: &[PathBuf], file: &Path, limit: usize, progress: &IndexProgress) -> io::Result<()> {
@@ -198,11 +226,11 @@ impl Catalog {
             out.write_all(&0u32.to_le_bytes())?;
             out.write_all(key.as_bytes())?;
             let mut offsets = File::open(&offsets_path)?;
-            io::copy(&mut offsets, &mut out)?;
+            copy_with_cancel(&mut offsets, &mut out, progress)?;
             let mut masks = File::open(&masks_path)?;
-            io::copy(&mut masks, &mut out)?;
+            copy_with_cancel(&mut masks, &mut out, progress)?;
             let mut input = File::open(&spool_path)?;
-            io::copy(&mut input, &mut out)?;
+            copy_with_cancel(&mut input, &mut out, progress)?;
             out.flush()?;
             drop(out);
             drop(input);
@@ -222,38 +250,91 @@ impl Catalog {
         self.summary
     }
 
-    /// Return the best matches by filename, without allocating per entry.
+    pub fn accelerated(&self) -> bool {
+        self.lookup.is_some()
+    }
+
+    /// Rank the best filenames, using the accelerator whenever possible.
+    /// Rare or non-ASCII queries still have an exact, exhaustive fallback.
     pub fn search(&self, query: &str, limit: usize) -> Vec<&str> {
+        self.search_with_cancel(query, limit, || false)
+    }
+
+    /// Interrupt a superseded search between candidate batches.
+    pub fn search_with_cancel(
+        &self, query: &str, limit: usize, mut cancelled: impl FnMut() -> bool,
+    ) -> Vec<&str> {
         let query = query.trim();
-        if query.is_empty() || limit == 0 {
-            return Vec::new();
-        }
+        if query.is_empty() || limit == 0 { return Vec::new(); }
         let limit = limit.min(RESULT_LIMIT);
         let needle = query.to_lowercase();
-        let required = if needle.is_ascii() { filename_mask(&needle) } else { 0 };
-        let allow_typo = needle.chars().count() >= 5;
-        let bytes = self.mapped.bytes();
         let mut best = BinaryHeap::with_capacity(limit + 1);
-        for i in 0..self.count {
-            if required != 0 {
-                let Some(mask) = word64(bytes, self.masks + i * 8) else { continue };
-                let missing = (required & !mask).count_ones();
-                if missing > if allow_typo { 1 } else { 0 } { continue; }
-            }
-            let Some(path) = self.path_at(i) else { continue };
-            let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
-            let Some(score) = rank(name, &needle) else { continue };
-            let candidate = Reverse(Match { score, path });
-            if best.len() < limit {
-                best.push(candidate);
-            } else if best.peek().is_some_and(|worst| candidate > *worst) {
-                best.pop();
-                best.push(candidate);
+        let mut used_index = false;
+
+        if let Some(lookup) = &self.lookup
+            && needle.is_ascii() && needle.len() >= 3
+            && lookup.selective(&needle)
+            && let Some(ids) = lookup.substring_candidates(&needle)
+        {
+            used_index = true;
+            for (n, id) in ids.into_iter().enumerate() {
+                if n % 1024 == 0 && cancelled() { return Vec::new(); }
+                self.offer(id as usize, &needle, limit, false, &mut best);
             }
         }
+
+        // When there are no substring hits, use overlapping trigrams to
+        // narrow one-edit typo candidates on sufficiently long queries.
+        let mut fuzzy_indexed = false;
+        if used_index && best.is_empty() && needle.chars().count() >= 7
+            && let Some(ids) = self.lookup.as_ref()
+                .and_then(|lookup| lookup.fuzzy_candidates(&needle))
+        {
+            fuzzy_indexed = true;
+            for (n, id) in ids.into_iter().enumerate() {
+                if n % 1024 == 0 && cancelled() { return Vec::new(); }
+                self.offer(id as usize, &needle, limit, true, &mut best);
+            }
+        }
+
+        // One- and two-character searches, Unicode and short typo queries
+        // retain the exhaustive fallback for correctness.
+        if !used_index || (best.is_empty() && needle.chars().count() >= 5 && !fuzzy_indexed) {
+            // Use a mask before touching the UTF-8 path section.
+            let required = if needle.is_ascii() { filename_mask(&needle) } else { 0 };
+            let allow_typo = needle.chars().count() >= 5;
+            let bytes = self.mapped.bytes();
+            for i in 0..self.count {
+                if i % 4096 == 0 && cancelled() { return Vec::new(); }
+                if required != 0 {
+                    let Some(mask) = word64(bytes, self.masks + i * 8) else { continue };
+                    let missing = (required & !mask).count_ones();
+                    if missing > if allow_typo { 1 } else { 0 } { continue; }
+                }
+                self.offer(i, &needle, limit, true, &mut best);
+            }
+        }
+
         let mut found: Vec<_> = best.into_iter().map(|r| r.0).collect();
         found.sort_unstable_by(|a, b| b.cmp(a));
         found.into_iter().map(|m| m.path).collect()
+    }
+
+    fn offer<'a>(
+        &'a self, id: usize, needle: &str, limit: usize, allow_fuzzy: bool,
+        best: &mut BinaryHeap<Reverse<Match<'a>>>,
+    ) {
+        let Some(path) = self.path_at(id) else { return };
+        let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+        let Some(score) = rank(name, needle) else { return };
+        if !allow_fuzzy && score < 1000 { return; }
+        let candidate = Reverse(Match { score, path });
+        if best.len() < limit {
+            best.push(candidate);
+        } else if best.peek().is_some_and(|worst| candidate.0 > worst.0) {
+            best.pop();
+            best.push(candidate);
+        }
     }
 
     fn path_at(&self, i: usize) -> Option<&str> {
@@ -290,6 +371,11 @@ fn rank(name: &str, query: &str) -> Option<i32> {
     }
     if !name.is_ascii() || !query.is_ascii() {
         let lower = name.to_lowercase();
+        // A Unicode filename may lowercase into an entirely ASCII name
+        // (e.g. the Kelvin sign K → k). Preserve typo matching after folding.
+        if lower.is_ascii() && query.is_ascii() {
+            return rank_ascii(lower.as_bytes(), query.as_bytes());
+        }
         return rank_unicode(&lower, query);
     }
     rank_ascii(name.as_bytes(), query.as_bytes())
@@ -300,10 +386,11 @@ fn rank_ascii(name: &[u8], query: &[u8]) -> Option<i32> {
     if name.eq_ignore_ascii_case(query) {
         return Some(4000);
     }
-    if query.len() <= name.len() {
-        if let Some(index) = name.windows(query.len()).position(|part| part.eq_ignore_ascii_case(query)) {
-            return Some(if index == 0 { 3000 } else { 2000 } - length - index as i32);
-        }
+    if query.len() <= name.len()
+        && let Some(index) = name.windows(query.len())
+            .position(|part| part.eq_ignore_ascii_case(query))
+    {
+        return Some(if index == 0 { 3000 } else { 2000 } - length - index as i32);
     }
     if query.len() < 5 || query.len() > name.len() {
         return None;
@@ -408,6 +495,22 @@ fn word64(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?))
 }
 
+/// Copy large index sections in chunks so Esc remains responsive while
+/// the snapshot is being assembled, not just during directory enumeration.
+fn copy_with_cancel(
+    input: &mut impl Read, output: &mut impl Write, progress: &IndexProgress,
+) -> io::Result<()> {
+    let mut block = [0u8; 64 * 1024];
+    loop {
+        if progress.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "indexing cancelled"));
+        }
+        let size = input.read(&mut block)?;
+        if size == 0 { return Ok(()); }
+        output.write_all(&block[..size])?;
+    }
+}
+
 fn word(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?))
 }
@@ -450,7 +553,7 @@ mod tests {
     fn persistent_index_and_unicode() {
         let dir = fixture();
         let file = dir.join("index.dat");
-        let roots = normalize_roots(&[dir.clone()]).unwrap();
+        let roots = normalize_roots(std::slice::from_ref(&dir)).unwrap();
         Catalog::build_to_path(&roots, &file, 100, &IndexProgress::default()).unwrap();
         let catalog = Catalog::load(&file, &roots_key(&roots)).unwrap();
         assert_eq!(catalog.search("minecraft", 10).len(), 1);
@@ -472,7 +575,7 @@ mod tests {
     #[test]
     fn bounded_scan() {
         let dir = fixture();
-        let roots = normalize_roots(&[dir.clone()]).unwrap();
+        let roots = normalize_roots(std::slice::from_ref(&dir)).unwrap();
         let file = dir.join("bound.dat");
         Catalog::build_to_path(&roots, &file, 1, &IndexProgress::default()).unwrap();
         let catalog = Catalog::load(&file, &roots_key(&roots)).unwrap();
@@ -526,6 +629,193 @@ mod tests {
         let typo = filename_mask("minecrafx");
         assert!((query & !typo).count_ones() <= 1);
         assert_eq!(filename_mask("日本語"), u64::MAX);
+    }
+
+
+    // Opt-in performance check against a synthetic catalog. It avoids touching
+    // the user's filesystem, so we can compare algorithms on the same data.
+    #[test]
+    #[ignore = "run with cargo test --release -- --ignored --nocapture"]
+    fn benchmark_search() {
+        use std::time::Instant;
+        let root = std::env::temp_dir().join(format!("fsearch-bench-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("bench.idx");
+        let roots = "synthetic-root";
+        let count = std::env::var("FSEARCH_BENCH_FILES").ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(300_000)
+            .clamp(1, 3_000_000);
+        let mut offsets = Vec::with_capacity(count as usize + 1);
+        let mut masks = Vec::with_capacity(count as usize);
+        let mut paths = Vec::new();
+        offsets.push(0u32);
+        for i in 0..count {
+            let name = if i % 1000 == 0 { format!("minecraft-{i}.exe") } else { format!("project-{i:08}.rs") };
+            paths.extend_from_slice(format!("C:\\bench\\{name}").as_bytes());
+            offsets.push(paths.len() as u32);
+            masks.push(filename_mask(&name));
+        }
+        let mut out = BufWriter::new(File::create(&file).unwrap());
+        out.write_all(MAGIC).unwrap();
+        out.write_all(&(roots.len() as u32).to_le_bytes()).unwrap();
+        out.write_all(&count.to_le_bytes()).unwrap();
+        out.write_all(&1u32.to_le_bytes()).unwrap();
+        out.write_all(&0u32.to_le_bytes()).unwrap();
+        out.write_all(&0u32.to_le_bytes()).unwrap();
+        out.write_all(&0u32.to_le_bytes()).unwrap();
+        out.write_all(roots.as_bytes()).unwrap();
+        for offset in offsets { out.write_all(&offset.to_le_bytes()).unwrap(); }
+        for mask in masks { out.write_all(&mask.to_le_bytes()).unwrap(); }
+        out.write_all(&paths).unwrap();
+        out.flush().unwrap();
+        drop(out);
+        let catalog = Catalog::load(&file, roots).unwrap();
+        for query in ["minecraft", "project", "proj", "minecarft"] {
+            let _ = catalog.search(query, 30);
+            let mut durations = Vec::new();
+            let mut full_scan = Vec::new();
+            for _ in 0..7 {
+                let before = Instant::now();
+                std::hint::black_box(catalog.search(query, 30));
+                durations.push(before.elapsed());
+
+                let started = Instant::now();
+                let mut best = BinaryHeap::new();
+                for id in 0..catalog.count {
+                    catalog.offer(id, query, 30, true, &mut best);
+                }
+                std::hint::black_box(best);
+                full_scan.push(started.elapsed());
+            }
+            durations.sort_unstable();
+            full_scan.sort_unstable();
+            println!("{query}: indexed {:.3} ms vs linear {:.3} ms ({} entries)",
+                durations[3].as_secs_f64() * 1000.0, full_scan[3].as_secs_f64() * 1000.0, count);
+        }
+        drop(catalog);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexed_results_remain_accurate() {
+        let dir = fixture();
+        fs::create_dir_all(dir.join("another")).unwrap();
+        for (where_, name) in [
+            ("folder", "cat.txt"),
+            ("another", "cat.txt"),
+            ("folder", "my-cat.doc"),
+            ("folder", "category.rs"),
+            ("folder", "猫-cat.txt"),
+            ("folder", "Kitty.txt"),
+            ("folder", "caterpillar.txt"),
+            ("folder", "Minecraft.exe"),
+            ("folder", "ab_x_bc.txt"),
+        ] {
+            fs::write(dir.join(where_).join(name), "test").unwrap();
+        }
+        let (catalog, _) = Catalog::open_or_build(std::slice::from_ref(&dir), 200, true).unwrap();
+        assert!(catalog.lookup.is_some(), "lookup must build for the fixture");
+        let cat = catalog.search("cat", 50);
+        assert_eq!(cat.len(), 6);
+        assert!(cat[0].ends_with(r"cat.txt") || cat[0].ends_with("cat.txt"));
+        assert_eq!(cat.iter().filter(|p| p.ends_with("cat.txt")).count(), 3);
+        assert!(catalog.search("minecraft", 10).iter().any(|p| p.ends_with("Minecraft.exe")));
+        assert_eq!(catalog.search("minecarft", 10).len(), 2);
+        assert_eq!(catalog.search("日本語", 10).len(), 1);
+        assert!(catalog.search("kitty", 10).iter().any(|p| p.ends_with("Kitty.txt")));
+        assert!(catalog.search("xyzcatx", 10).is_empty());
+        assert!(!catalog.search("ca", 10).is_empty());
+        drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_lookup_is_rebuilt() {
+        let dir = fixture();
+        let roots = vec![dir.clone()];
+        let (catalog, _) = Catalog::open_or_build(&roots, 100, true).unwrap();
+        assert!(catalog.accelerated());
+        let canonical = normalize_roots(&roots).unwrap();
+        let lookup_path = index_path(&roots_key(&canonical)).with_extension("lookup");
+        drop(catalog);
+        fs::write(&lookup_path, b"corrupt lookup").unwrap();
+        let (catalog, cached) = Catalog::open_or_build(&roots, 100, false).unwrap();
+        assert!(cached, "the filesystem catalog should not be rebuilt");
+        assert!(catalog.accelerated(), "the lookup should be recovered");
+        assert_eq!(catalog.search("minecraft", 10).len(), 1);
+        drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancelled_search_returns_promptly() {
+        let dir = fixture();
+        let (catalog, _) = Catalog::open_or_build(std::slice::from_ref(&dir), 100, true).unwrap();
+        let mut checks = 0usize;
+        let result = catalog.search_with_cancel("a", 10, || {
+            checks += 1;
+            true
+        });
+        assert!(checks > 0);
+        assert!(result.is_empty());
+        drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repetitive_typo_falls_back_safely() {
+        let dir = fixture();
+        fs::write(dir.join("folder").join("aaaaaab.log"), "test").unwrap();
+        let (catalog, _) = Catalog::open_or_build(std::slice::from_ref(&dir), 1000, true).unwrap();
+        assert!(catalog.accelerated());
+        assert!(catalog.search("aaaaaac", 20)
+            .iter().any(|p| p.ends_with("aaaaaab.log")));
+        drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unicode_typo_is_not_lost_by_trigrams() {
+        let dir = fixture();
+        fs::write(dir.join("folder").join("Kittenzz.txt"), "test").unwrap();
+        let (catalog, _) = Catalog::open_or_build(std::slice::from_ref(&dir), 1000, true).unwrap();
+        assert!(catalog.search("kittenxz", 20)
+            .iter().any(|p| p.ends_with("Kittenzz.txt")));
+        drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn index_copy_is_cancellable() {
+        let progress = IndexProgress::default();
+        let mut contents = Vec::new();
+        let mut source = std::io::Cursor::new(vec![42u8; 200_000]);
+        copy_with_cancel(&mut source, &mut contents, &progress).unwrap();
+        assert_eq!(contents.len(), 200_000);
+        progress.cancel();
+        let result = copy_with_cancel(&mut std::io::Cursor::new(b"new"), &mut Vec::new(), &progress);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn cancelling_lookup_preparation_keeps_catalog() {
+        let dir = fixture();
+        let roots = normalize_roots(std::slice::from_ref(&dir)).unwrap();
+        let file = dir.join("lookup-cancel.idx");
+        Catalog::build_to_path(&roots, &file, 100, &IndexProgress::default()).unwrap();
+        let progress = IndexProgress::default();
+        progress.cancel();
+        let err = match Catalog::load_with_progress(&file, &roots_key(&roots), Some(&progress)) {
+            Ok(_) => panic!("lookup builder ignored cancellation"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        // The original filename snapshot remains readable after cancellation.
+        let catalog = Catalog::load(&file, &roots_key(&roots)).unwrap();
+        assert_eq!(catalog.search("minecraft", 10).len(), 1);
+        drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
