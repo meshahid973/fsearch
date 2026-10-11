@@ -124,7 +124,10 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
             redraw = false;
         }
 
-        let Some(event) = term.read_timeout(65)? else { continue };
+        // Poll more frequently only while results are being calculated;
+        // otherwise sleep on the console event instead of waking constantly.
+        let wait_ms = if pending { 12 } else { 100 };
+        let Some(event) = term.read_timeout(wait_ms)? else { continue };
         let Event::Key(event) = event else {
             if matches!(event, Event::Resize(..)) { redraw = true; }
             continue;
