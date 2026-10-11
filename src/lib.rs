@@ -5,3 +5,6 @@
 
 pub mod catalog;
 pub use catalog::{Catalog, ScanSummary, DEFAULT_ENTRY_LIMIT, default_root};
+
+#[cfg(windows)]
+pub mod gui;
