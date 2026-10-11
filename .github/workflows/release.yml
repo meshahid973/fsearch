@@ -17,6 +17,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify dependency lockfile
+        shell: pwsh
+        run: |
+          cargo generate-lockfile
+          Write-Output 'FSEARCH_LOCK_BEGIN'
+          Get-Content Cargo.lock
+          Write-Output 'FSEARCH_LOCK_END'
+          git diff --exit-code -- Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw 'Commit the updated Cargo.lock before publishing a release' }
+
       - name: Test
         run: cargo test --all-targets --locked
 
