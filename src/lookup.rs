@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"FSLOOK02";
+const MAGIC: &[u8; 8] = b"FSLOOK03";
 const UNICODE_GRAM: u32 = 0x0100_0000;
 const HEADER: usize = 32;
 const GRAM_ENTRY: usize = 16;
@@ -38,17 +38,6 @@ impl Lookup {
             return Ok(lookup);
         }
         on_build();
-
-        let mut sorted: Vec<u32> = (0..count)
-            .map(|i| u32::try_from(i).map_err(|_| invalid("too many entries")))
-            .collect::<Result<_, _>>()?;
-        // Store just the original row ID, never a second copy of every path.
-        // Sorting references the original memory-mapped index.
-        sorted.sort_unstable_by(|a, b| {
-            let left = name_at(*a as usize).unwrap_or_default();
-            let right = name_at(*b as usize).unwrap_or_default();
-            ascii_cmp(left.as_bytes(), right.as_bytes()).then_with(|| a.cmp(b))
-        });
 
         // One posting per distinct 3-byte gram per filename. The postings are
         // ordered by row ID so they can be intersected without hash tables.
@@ -82,9 +71,6 @@ impl Lookup {
             out.write_all(&source_modified.to_le_bytes())?;
             write_u32(&mut out, count)?;
             write_u32(&mut out, grams.len())?;
-            for id in &sorted {
-                out.write_all(&id.to_le_bytes())?;
-            }
             let mut pos: u64 = 0;
             for (key, postings) in &grams {
                 out.write_all(&key.to_le_bytes())?;
@@ -101,7 +87,8 @@ impl Lookup {
             drop(out);
             // The source snapshot is never changed by this step; an incomplete
             // lookup is simply discarded and rebuilt on the next launch.
-            if path.exists() { fs::remove_file(&path)?; }
+            // Rename over the old lookup only after the new file is complete.
+            // If replacement fails, the existing lookup remains intact.
             fs::rename(&path_tmp, &path)?;
             Ok(())
         })();
@@ -122,8 +109,7 @@ impl Lookup {
             return Err(invalid("outdated lookup"));
         }
         let gram_count = u32_at(b, 28).unwrap_or(0) as usize;
-        let directory = HEADER.checked_add(count.checked_mul(4).ok_or_else(|| invalid("entry overflow"))?)
-            .ok_or_else(|| invalid("entry overflow"))?;
+        let directory = HEADER;
         let postings = directory.checked_add(gram_count.checked_mul(GRAM_ENTRY)
             .ok_or_else(|| invalid("gram overflow"))?)
             .ok_or_else(|| invalid("gram overflow"))?;
@@ -154,34 +140,6 @@ impl Lookup {
             .min()
             .unwrap_or(0);
         smallest <= self.count.saturating_div(32).max(96)
-    }
-
-    /// Sorted filename references allow binary-prefix lookup without touching
-    /// unrelated file paths. Candidates are verified by the caller.
-    pub fn prefix<'a>(&self, needle: &str, mut name_at: impl FnMut(usize) -> Option<&'a str>) -> Vec<u32> {
-        if !needle.is_ascii() { return Vec::new(); }
-        let b = self.file.bytes();
-        let mut low = 0;
-        let mut high = self.count;
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let id = u32_at(b, HEADER + mid * 4).unwrap_or(0);
-            let name = name_at(id as usize).unwrap_or_default();
-            if ascii_cmp(name.as_bytes(), needle.as_bytes()).is_lt()
-                && !starts_ignore_ascii_case(name.as_bytes(), needle.as_bytes()) {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        let mut ids = Vec::new();
-        for i in low..self.count {
-            let id = u32_at(b, HEADER + i * 4).unwrap_or(0);
-            let Some(name) = name_at(id as usize) else { break };
-            if !starts_ignore_ascii_case(name.as_bytes(), needle.as_bytes()) { break; }
-            ids.push(id);
-        }
-        ids
     }
 
     /// Return row IDs containing every trigram in the ASCII query. We choose
@@ -225,8 +183,8 @@ impl Lookup {
 
     /// Single-edit typo candidates for longer ASCII queries. A substitution
     /// damages at most three trigrams; an adjacent swap damages at most four.
-    /// Checking up to five distinct trigrams guarantees at least one surviving
-    /// gram for queries with seven or more bytes. Final ranking verifies edits.
+    /// We require five distinct query trigrams, otherwise callers must run
+    /// an exhaustive fallback. Final ranking verifies actual edits.
     /// A bounded output prevents exceptionally common grams from spiking RAM.
     pub fn fuzzy_candidates(&self, needle: &str) -> Option<Vec<u32>> {
         if !needle.is_ascii() || needle.len() < 7 { return None; }
@@ -236,6 +194,13 @@ impl Lookup {
         let mut lists: Vec<(usize, usize)> = keys.into_iter()
             .filter_map(|key| self.postings_for(key))
             .collect();
+        // An adjacent swap can invalidate up to four trigrams. Unless five
+        // distinct query trigrams exist, the candidate union is incomplete
+        // and the caller must use its exhaustive fallback.
+        if needle.as_bytes().windows(3)
+            .map(gram).collect::<std::collections::BTreeSet<_>>().len() < 5 {
+            return None;
+        }
         lists.sort_unstable_by_key(|r| r.1);
         let mut out = Vec::new();
         let mut budget = 0usize;
@@ -291,12 +256,6 @@ fn modified_ns(meta: &fs::Metadata) -> u64 {
     meta.modified().ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos() as u64)
-}
-fn ascii_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-    a.iter().map(u8::to_ascii_lowercase).cmp(b.iter().map(u8::to_ascii_lowercase))
-}
-fn starts_ignore_ascii_case(name: &[u8], prefix: &[u8]) -> bool {
-    name.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix))
 }
 fn gram(bytes: &[u8]) -> u32 {
     (u32::from(bytes[0].to_ascii_lowercase()) << 16)
