@@ -7,6 +7,7 @@ use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, IndexProgress, ScanSummary};
 use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::console::Terminal;
+use crate::latency::LatencyHistory;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -88,6 +89,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
     let mut worker = start_search_worker(catalog);
     let mut selected = 0usize;
     let mut elapsed = Duration::ZERO;
+    let mut history = LatencyHistory::new();
     let mut hits: Vec<String> = Vec::new();
     let mut generation = 0u64;
     let mut pending = false;
@@ -97,7 +99,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
         generation += 1;
         let (_, height) = term.dimensions();
         worker.newest.store(generation, Ordering::Relaxed);
-        worker.queries.send((generation, query.clone(), height.saturating_sub(10).clamp(3, 50)))
+        worker.queries.send((generation, query.clone(), result_limit(height)))
             .map_err(|_| io::Error::other("search worker stopped"))?;
         pending = true;
     }
@@ -105,13 +107,14 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
         while let Ok(found) = worker.results.try_recv() {
             if found.generation != generation { continue; }
             elapsed = found.elapsed;
+            if !query.is_empty() { history.push(found.elapsed); }
             hits = found.paths;
             selected = selected.min(hits.len().saturating_sub(1));
             pending = false;
             redraw = true;
         }
         if redraw {
-            draw(term, out, &query, &hits, selected, elapsed, summary, cached, &roots, pending, accelerated)?;
+            draw(term, out, &query, &hits, selected, elapsed, summary, cached, &roots, pending, accelerated, &history)?;
             redraw = false;
         }
 
@@ -153,6 +156,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 summary = updated.summary();
                 accelerated = updated.accelerated();
                 cached = from_disk;
+                history.clear();
                 worker = start_search_worker(updated);
                 hits.clear();
                 pending = false;
@@ -174,7 +178,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
             } else {
                 let (_, height) = term.dimensions();
                 worker.newest.store(generation, Ordering::Relaxed);
-                worker.queries.send((generation, query.clone(), height.saturating_sub(10).clamp(3, 50)))
+                worker.queries.send((generation, query.clone(), result_limit(height)))
                     .map_err(|_| io::Error::other("search worker stopped"))?;
                 pending = true;
             }
@@ -267,6 +271,15 @@ fn apply_text_key(query: &mut String, event: &KeyEvent) -> bool {
     }
 }
 
+/// Keep result rows clear of the footer and the latency history.
+fn result_limit(height: usize) -> usize {
+    if height >= 16 {
+        height.saturating_sub(13).clamp(3, 50)
+    } else {
+        height.saturating_sub(10).clamp(3, 50)
+    }
+}
+
 fn draw(
     term: &Terminal,
     out: &mut impl Write,
@@ -279,6 +292,7 @@ fn draw(
     roots: &[PathBuf],
     pending: bool,
     accelerated: bool,
+    history: &LatencyHistory,
 ) -> io::Result<()> {
     let (width, height) = term.dimensions();
     let width = width.min(240);
@@ -301,7 +315,7 @@ fn draw(
         shorten(query, width.saturating_sub(33)), duration.as_secs_f64() * 1000.0));
     let bar = "─".repeat(width.saturating_sub(margin.len() + 4));
     buffer.push_str(&format!("{margin}{GREY}{bar}{RESET}{BG}\n"));
-    let max = height.saturating_sub(10);
+    let max = result_limit(height);
     for (i, path) in hits.iter().take(max).enumerate() {
         let idx = path.rfind(['\\', '/']);
         let name = idx.map_or(path.as_str(), |n| &path[n + 1..]);
@@ -310,6 +324,30 @@ fn draw(
         let folder = shorten(location, width.saturating_sub(file.chars().count() + margin.len() + 6));
         let marker = if i == selected { format!("{BLUE}›{RESET}{BG}") } else { " ".to_string() };
         buffer.push_str(&format!("{margin}{marker} {BOLD}{file}{RESET}{BG}  {GREY}{folder}{RESET}{BG}\n"));
+    }
+    // Reserve two bottom rows for the green latency sparkline. A small
+    // terminal omits it rather than letting the chart overlap search results.
+    if height >= 16 {
+        let graph_width = width.saturating_sub(margin.len() + 3).min(64);
+        if let Some(stats) = history.stats() {
+            let title = format!(
+                "Latency  ·  {} searches  ·  avg {:.2} ms  ·  p95 {:.2} ms",
+                stats.count, stats.average_ms, stats.p95_ms,
+            );
+            buffer.push_str(&format!(
+                "\x1b[{};1H{margin}{GREY}{}{RESET}{BG}",
+                height - 5, shorten(&title, width.saturating_sub(margin.len() + 2)),
+            ));
+            buffer.push_str(&format!(
+                "\x1b[{};1H{margin}{GREEN}{}{RESET}{BG}  {GREY}peak {:.2} ms{RESET}{BG}",
+                height - 4, history.sparkline(graph_width), stats.peak_ms,
+            ));
+        } else {
+            buffer.push_str(&format!(
+                "\x1b[{};1H{margin}{GREY}Latency  ·  waiting for searches{RESET}{BG}",
+                height - 5,
+            ));
+        }
     }
     let partial = if info.truncated { "  ·  index incomplete (limit reached)" } else { "" };
     let origin = if cached { "saved index" } else { "new index" };
@@ -379,6 +417,14 @@ mod tests {
         assert_eq!(query, "m");
         assert!(!apply_text_key(&mut query, &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)));
         assert_eq!(query, "m");
+    }
+
+    #[test]
+    fn latency_graph_reserves_space_for_results() {
+        assert_eq!(result_limit(30), 17);
+        assert_eq!(result_limit(16), 3);
+        assert_eq!(result_limit(12), 3);
+        assert_eq!(result_limit(100), 50);
     }
 
     #[test]
