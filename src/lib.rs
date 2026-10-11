@@ -3,4 +3,4 @@
 pub mod catalog;
 mod mapped;
 pub mod walk;
-pub use catalog::{Catalog, ScanSummary, DEFAULT_ENTRY_LIMIT, default_root, default_roots};
+pub use catalog::{Catalog, ScanSummary, IndexProgress, ProgressSnapshot, DEFAULT_ENTRY_LIMIT, default_root, default_roots};
