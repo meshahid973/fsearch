@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"FSWIN002";
 const HEADER: usize = 32;
-pub const DEFAULT_ENTRY_LIMIT: usize = 1_000_000;
+pub const DEFAULT_ENTRY_LIMIT: usize = 12_000_000;
 const RESULT_LIMIT: usize = 5000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -203,96 +203,68 @@ impl Ord for Match<'_> {
     }
 }
 
-fn rank(name: &str, needle: &str) -> Option<i32> {
-    if !name.is_ascii() || !needle.is_ascii() {
-        let name = name.to_lowercase();
-        return match_rank(name.as_bytes(), needle.as_bytes());
+/// Rank useful filename matches. Very loose subsequence matches were
+/// returning unrelated files (e.g. "haha" matching "hashmap").
+///
+/// Matching is exact > prefix > substring > one typo (for 5+ characters).
+fn rank(name: &str, query: &str) -> Option<i32> {
+    if query.is_empty() {
+        return None;
     }
-    let bytes = name.as_bytes();
-    let query = needle.as_bytes();
-    if bytes.eq_ignore_ascii_case(query) {
-        return Some(3000);
+    if !name.is_ascii() || !query.is_ascii() {
+        let lower = name.to_lowercase();
+        return rank_unicode(&lower, query);
     }
-    let position = bytes.windows(query.len()).position(|part| part.eq_ignore_ascii_case(query));
-    if let Some(at) = position {
-        return Some(if at == 0 { 2200 } else { 1600 } - name.len().min(500) as i32 - at as i32);
-    }
-    // Fast ASCII fallback: compare with case folding, but allocate nothing.
-    match_rank_ascii(bytes, query)
+    rank_ascii(name.as_bytes(), query.as_bytes())
 }
 
-
-fn match_rank_ascii(name: &[u8], needle: &[u8]) -> Option<i32> {
-    let mut next = 0usize;
-    let mut gaps = 0i32;
-    for &byte in name {
-        if next < needle.len() && byte.eq_ignore_ascii_case(&needle[next]) {
-            next += 1;
-        } else if next > 0 && next < needle.len() {
-            gaps += 1;
+fn rank_ascii(name: &[u8], query: &[u8]) -> Option<i32> {
+    let length = name.len().min(500) as i32;
+    if name.eq_ignore_ascii_case(query) {
+        return Some(4000);
+    }
+    if query.len() <= name.len() {
+        if let Some(index) = name.windows(query.len()).position(|part| part.eq_ignore_ascii_case(query)) {
+            return Some(if index == 0 { 3000 } else { 2000 } - length - index as i32);
         }
     }
-    if next == needle.len() {
-        return Some(500 - gaps - name.len().min(200) as i32);
+    if query.len() < 5 || query.len() > name.len() {
+        return None;
     }
-    if needle.len() >= 4 {
-        for window in name.windows(needle.len()) {
-            let mut i = 0usize;
-            let mut swapped = false;
-            while i < needle.len() {
-                if window[i].eq_ignore_ascii_case(&needle[i]) {
-                    i += 1;
-                } else if !swapped && i + 1 < needle.len()
-                    && window[i].eq_ignore_ascii_case(&needle[i + 1])
-                    && window[i + 1].eq_ignore_ascii_case(&needle[i])
-                {
-                    swapped = true;
-                    i += 2;
+    // A single typo is reasonable for longer queries, but scattered letters
+    // are not a match. Check contiguous windows without allocating memory.
+    let mut best = None;
+    for window in name.windows(query.len()) {
+        let mut wrong = None;
+        let mut second = None;
+        for (i, (&actual, &expected)) in window.iter().zip(query).enumerate() {
+            if !actual.eq_ignore_ascii_case(&expected) {
+                if wrong.is_none() {
+                    wrong = Some(i);
+                } else if second.is_none() {
+                    second = Some(i);
                 } else {
                     break;
                 }
             }
-            if i == needle.len() && swapped {
-                return Some(400 - name.len().min(200) as i32);
-            }
         }
+        let score = match (wrong, second) {
+            (Some(_), None) => Some(400 - length),
+            (Some(a), Some(b)) if b == a + 1
+                && window[a].eq_ignore_ascii_case(&query[b])
+                && window[b].eq_ignore_ascii_case(&query[a]) => Some(500 - length),
+            _ => None,
+        };
+        best = best.max(score);
     }
-    None
+    best
 }
 
-fn match_rank(name: &[u8], needle: &[u8]) -> Option<i32> {
-    if needle.is_empty() {
-        return None;
+fn rank_unicode(name: &str, query: &str) -> Option<i32> {
+    if name == query {
+        return Some(4000);
     }
-    if name == needle {
-        return Some(3000);
-    }
-    if let Some(pos) = name.windows(needle.len()).position(|part| part == needle) {
-        return Some(if pos == 0 { 2200 } else { 1600 } - name.len().min(500) as i32 - pos as i32);
-    }
-    let mut next = 0;
-    let mut gaps = 0i32;
-    for &byte in name {
-        if next < needle.len() && byte == needle[next] {
-            next += 1;
-        } else if next > 0 && next < needle.len() {
-            gaps += 1;
-        }
-    }
-    if next == needle.len() {
-        return Some(500 - gaps - name.len().min(200) as i32);
-    }
-    // Adjacent letter swaps are common typos, e.g. mian -> main.
-    if needle.len() >= 4 {
-        for swap in 0..needle.len() - 1 {
-            let mut candidate = needle.to_vec();
-            candidate.swap(swap, swap + 1);
-            if name.windows(candidate.len()).any(|w| w == candidate) {
-                return Some(400 - name.len().min(200) as i32);
-            }
-        }
-    }
-    None
+    name.find(query).map(|pos| if pos == 0 { 3000 } else { 2000 } - name.len().min(500) as i32 - pos as i32)
 }
 
 fn normalize_roots(roots: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
@@ -432,6 +404,21 @@ mod tests {
         assert_eq!(fresh.search("later", 10).len(), 1);
         drop(fresh);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn avoids_unrelated_subsequence_matches() {
+        assert!(rank("shahzain.mp3", "haha").is_none());
+        assert!(rank("hashmap.rs", "haha").is_none());
+        assert!(rank("haha.txt", "haha").is_some());
+        assert!(rank("main.rs", "mian.rs").is_some());
+    }
+
+    #[test]
+    fn ranks_exact_prefix_and_typo() {
+        assert!(rank("fsearch", "fsearch") > rank("fsearch.rs", "fsearch"));
+        assert!(rank("fsearch.rs", "fsearch") > rank("my-fsearch.rs", "fsearch"));
+        assert!(rank("fsearch.rs", "fsearch") > rank("fsearhc.rs", "fsearch"));
     }
 
     #[test]
