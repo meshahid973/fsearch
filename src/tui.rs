@@ -5,6 +5,7 @@
 
 use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, IndexProgress, ScanSummary};
 use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::console::Terminal;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io::{self, Write};
@@ -38,11 +39,14 @@ struct SearchWorker {
     queries: mpsc::Sender<(u64, String, usize)>,
     results: mpsc::Receiver<SearchResult>,
     handle: std::thread::JoinHandle<()>,
+    newest: Arc<AtomicU64>,
 }
 
 fn start_search_worker(catalog: Catalog) -> SearchWorker {
     let (queries, rx) = mpsc::channel::<(u64, String, usize)>();
     let (tx, results) = mpsc::channel();
+    let newest = Arc::new(AtomicU64::new(0));
+    let worker_newest = Arc::clone(&newest);
     let handle = std::thread::spawn(move || {
         while let Ok(mut request) = rx.recv() {
             // Only the newest queued query matters while someone is typing.
@@ -50,8 +54,10 @@ fn start_search_worker(catalog: Catalog) -> SearchWorker {
                 request = next;
             }
             let started = Instant::now();
-            let paths = catalog.search(&request.1, request.2)
-                .into_iter().map(str::to_owned).collect();
+            let paths = catalog.search_with_cancel(&request.1, request.2, || {
+                worker_newest.load(Ordering::Relaxed) != request.0
+            }).into_iter().map(str::to_owned).collect();
+            if worker_newest.load(Ordering::Relaxed) != request.0 { continue; }
             if tx.send(SearchResult {
                 generation: request.0,
                 paths,
@@ -61,11 +67,12 @@ fn start_search_worker(catalog: Catalog) -> SearchWorker {
             }
         }
     });
-    SearchWorker { queries, results, handle }
+    SearchWorker { queries, results, handle, newest }
 }
 
 impl SearchWorker {
     fn stop(self) {
+        self.newest.store(u64::MAX, Ordering::Relaxed);
         drop(self.queries);
         let _ = self.handle.join();
     }
@@ -77,6 +84,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
         return Ok(());
     };
     let mut summary = catalog.summary();
+    let mut accelerated = catalog.accelerated();
     let mut worker = start_search_worker(catalog);
     let mut selected = 0usize;
     let mut elapsed = Duration::ZERO;
@@ -88,6 +96,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
     if !query.is_empty() {
         generation += 1;
         let (_, height) = term.dimensions();
+        worker.newest.store(generation, Ordering::Relaxed);
         worker.queries.send((generation, query.clone(), height.saturating_sub(10).clamp(3, 50)))
             .map_err(|_| io::Error::other("search worker stopped"))?;
         pending = true;
@@ -102,7 +111,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
             redraw = true;
         }
         if redraw {
-            draw(term, out, &query, &hits, selected, elapsed, summary, cached, &roots, pending)?;
+            draw(term, out, &query, &hits, selected, elapsed, summary, cached, &roots, pending, accelerated)?;
             redraw = false;
         }
 
@@ -142,6 +151,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                     return Ok(());
                 };
                 summary = updated.summary();
+                accelerated = updated.accelerated();
                 cached = from_disk;
                 worker = start_search_worker(updated);
                 hits.clear();
@@ -163,6 +173,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 elapsed = Duration::ZERO;
             } else {
                 let (_, height) = term.dimensions();
+                worker.newest.store(generation, Ordering::Relaxed);
                 worker.queries.send((generation, query.clone(), height.saturating_sub(10).clamp(3, 50)))
                     .map_err(|_| io::Error::other("search worker stopped"))?;
                 pending = true;
@@ -212,6 +223,7 @@ fn load_index(
             1 => "Scanning files",
             2 => "Saving index",
             3 => "Opening new index",
+            5 => "Preparing fast lookup",
             _ => "Finishing",
         };
         let label = format!(
@@ -266,6 +278,7 @@ fn draw(
     cached: bool,
     roots: &[PathBuf],
     pending: bool,
+    accelerated: bool,
 ) -> io::Result<()> {
     let (width, height) = term.dimensions();
     let width = width.min(240);
@@ -300,10 +313,11 @@ fn draw(
     }
     let partial = if info.truncated { "  ·  index incomplete (limit reached)" } else { "" };
     let origin = if cached { "saved index" } else { "new index" };
+    let mode = if accelerated { "fast lookup" } else { "scan fallback" };
     let status = if pending {
-        format!("searching...  ·  {origin} · {count} entries · {} skipped{partial}", info.skipped)
+        format!("searching...  ·  {origin} · {mode} · {count} entries · {} skipped{partial}", info.skipped)
     } else {
-        format!("{origin} · {count} entries · {} skipped{partial}", info.skipped)
+        format!("{origin} · {mode} · {count} entries · {} skipped{partial}", info.skipped)
     };
     let foot = "↑↓ select   Enter reveal   Ctrl+R reindex   Esc quit";
     buffer.push_str(&format!("\x1b[{};1H{margin}{GREY}{}{RESET}{BG}", height.saturating_sub(2), shorten(&status, width.saturating_sub(margin.len() + 1))));
