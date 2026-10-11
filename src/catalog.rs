@@ -5,7 +5,7 @@
 
 use crate::{mapped::MappedFile, walk, lookup::Lookup};
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::io::{self, BufWriter, Write};
@@ -264,22 +264,13 @@ impl Catalog {
             if needle.is_ascii() && needle.len() >= 3 && lookup.selective(&needle) {
                 if let Some(ids) = lookup.substring_candidates(&needle) {
                     used_index = true;
-                    let mut seen = HashSet::new();
-                    // Prefix matches are usually more relevant, and the
-                    // filename-sorted table finds them without scanning paths.
-                    for (n, id) in lookup.prefix(&needle, |i| {
-                        self.path_at(i).map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p))
-                    }).into_iter().enumerate() {
-                        if n % 1024 == 0 && cancelled() { return Vec::new(); }
-                        if seen.insert(id) {
-                            self.offer(id as usize, &needle, limit, false, &mut best);
-                        }
-                    }
+                    // Substring postings already include every ASCII prefix
+                    // candidate. A separate sorted-prefix pass duplicated
+                    // work and allocated an unnecessary vector for common
+                    // queries.
                     for (n, id) in ids.into_iter().enumerate() {
                         if n % 1024 == 0 && cancelled() { return Vec::new(); }
-                        if seen.insert(id) {
-                            self.offer(id as usize, &needle, limit, false, &mut best);
-                        }
+                        self.offer(id as usize, &needle, limit, false, &mut best);
                     }
                 }
             }
