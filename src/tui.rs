@@ -163,6 +163,8 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 accelerated = updated.accelerated();
                 cached = from_disk;
                 history.clear();
+                // The indexing screen replaced the alternate screen's header.
+                screen_state.size = None;
                 worker = start_search_worker(updated);
                 hits.clear();
                 pending = false;
