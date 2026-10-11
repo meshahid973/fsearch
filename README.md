@@ -1,38 +1,36 @@
 # FSearch
 
-Fast, lightweight file search for Windows. FSearch indexes filenames on local drives and lets you search them in a terminal window. Written in Rust.
+Lightweight file search for Windows, written in Rust. Search filenames across local drives in a terminal window.
 
-## Build
+## Download
 
-Install [Rust](https://rustup.rs/) and the Visual Studio C++ Build Tools.
+- [Windows installer](https://github.com/meshahid973/fsearch/releases/latest/download/FSearch-Setup-0.2.0.exe) — installs FSearch with a Start Menu shortcut.
+- [Portable ZIP](https://github.com/meshahid973/fsearch/releases/latest/download/FSearch-Windows-x64.zip) — extract and double-click `fsearch-launcher.exe`.
+
+Runs on Windows 10/11 x64. Neither download requires Rust or administrator access. The downloads are currently unsigned, so Windows SmartScreen may show a warning.
+
+## Use
+
+Type to search. Use ↑/↓ to select, Enter to reveal a file in Explorer, Ctrl+R to rebuild the index, or Esc to quit.
+
+The first launch indexes accessible files on your local fixed drives. Later launches reuse the saved index in `%LOCALAPPDATA%\FSearch`. New and deleted files appear after a manual refresh. Searching inside file contents is not supported.
+
+## Build from source
+
+Install [Rust](https://rustup.rs/) and Visual Studio C++ Build Tools, then run:
 
 ```powershell
-cargo build --release
+cargo build --release --locked
+.\target\release\fsearch-launcher.exe
 ```
 
-## Run
-
-```powershell
-.\target\release\fsearch.exe
-```
-
-This opens a new terminal window. The first scan shows its progress, and you can type a search while it runs. Later launches reuse the saved index. Use the arrow keys to select, Enter to reveal a file in Explorer, Ctrl+R to refresh, or Esc to quit.
-
-To use the current terminal instead:
-
-```powershell
-.\target\release\fsearch.exe --interactive
-```
-
-To print search results without opening an interactive window:
+Command-line searches:
 
 ```powershell
 .\target\release\fsearch.exe "minecraft"
 .\target\release\fsearch.exe "readme" --root "D:\"
 ```
 
-The index is saved in `%LOCALAPPDATA%\FSearch`. FSearch scans mounted fixed drives by default. New or deleted files require a refresh; searching inside file contents is not supported.
-
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE).
