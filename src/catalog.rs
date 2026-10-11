@@ -35,12 +35,15 @@ impl Catalog {
     /// Load an existing snapshot or scan the given roots and save a new one.
     /// The boolean is true if the existing index was loaded.
     pub fn open_or_build(roots: &[PathBuf], limit: usize, refresh: bool) -> io::Result<(Self, bool)> {
+        if limit == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "entry limit must be positive"));
+        }
         let roots = normalize_roots(roots)?;
         let key = roots_key(&roots);
         let file = index_path(&key);
         if !refresh {
             if let Ok(index) = Self::load(&file, &key) {
-                if index.summary.entries <= limit {
+                if index.summary.entries <= limit && !(index.summary.truncated && index.summary.entries < limit) {
                     return Ok((index, true));
                 }
             }
@@ -214,8 +217,47 @@ fn rank(name: &str, needle: &str) -> Option<i32> {
     if let Some(at) = position {
         return Some(if at == 0 { 2200 } else { 1600 } - name.len().min(500) as i32 - at as i32);
     }
-    let lower = name.to_ascii_lowercase();
-    match_rank(lower.as_bytes(), query)
+    // Fast ASCII fallback: compare with case folding, but allocate nothing.
+    match_rank_ascii(bytes, query)
+}
+
+
+fn match_rank_ascii(name: &[u8], needle: &[u8]) -> Option<i32> {
+    let mut next = 0usize;
+    let mut gaps = 0i32;
+    for &byte in name {
+        if next < needle.len() && byte.eq_ignore_ascii_case(&needle[next]) {
+            next += 1;
+        } else if next > 0 && next < needle.len() {
+            gaps += 1;
+        }
+    }
+    if next == needle.len() {
+        return Some(500 - gaps - name.len().min(200) as i32);
+    }
+    if needle.len() >= 4 {
+        for window in name.windows(needle.len()) {
+            let mut i = 0usize;
+            let mut swapped = false;
+            while i < needle.len() {
+                if window[i].eq_ignore_ascii_case(&needle[i]) {
+                    i += 1;
+                } else if !swapped && i + 1 < needle.len()
+                    && window[i].eq_ignore_ascii_case(&needle[i + 1])
+                    && window[i + 1].eq_ignore_ascii_case(&needle[i])
+                {
+                    swapped = true;
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            if i == needle.len() && swapped {
+                return Some(400 - name.len().min(200) as i32);
+            }
+        }
+    }
+    None
 }
 
 fn match_rank(name: &[u8], needle: &[u8]) -> Option<i32> {
@@ -368,6 +410,27 @@ mod tests {
         assert_eq!(catalog.summary().entries, 1);
         assert!(catalog.summary().truncated);
         drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reuses_and_refreshes_snapshot() {
+        let dir = fixture();
+        let file = dir.join("later.rs");
+        let roots = vec![dir.clone()];
+        let (loaded, cached) = Catalog::open_or_build(&roots, 1000, true).unwrap();
+        assert!(!cached);
+        assert!(loaded.search("later", 10).is_empty());
+        drop(loaded);
+        fs::write(&file, "created").unwrap();
+        let (old, cached) = Catalog::open_or_build(&roots, 1000, false).unwrap();
+        assert!(cached);
+        assert!(old.search("later", 10).is_empty());
+        drop(old);
+        let (fresh, cached) = Catalog::open_or_build(&roots, 1000, true).unwrap();
+        assert!(!cached);
+        assert_eq!(fresh.search("later", 10).len(), 1);
+        drop(fresh);
         fs::remove_dir_all(dir).unwrap();
     }
 
