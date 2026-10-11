@@ -230,7 +230,7 @@ impl Catalog {
         }
         let limit = limit.min(RESULT_LIMIT);
         let needle = query.to_lowercase();
-        let required = filename_mask(&needle);
+        let required = if needle.is_ascii() { filename_mask(&needle) } else { 0 };
         let allow_typo = needle.chars().count() >= 5;
         let bytes = self.mapped.bytes();
         let mut best = BinaryHeap::with_capacity(limit + 1);
