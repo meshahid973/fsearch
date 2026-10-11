@@ -18,7 +18,7 @@ struct Entry {
 
 impl Entry {
     fn new(path: &Path) -> Self {
-        let display = path.to_string_lossy().into_owned();
+        let display = display_path(path);
         let name_start = display.rfind(['/', '\\']).map_or(0, |i| i + 1);
         Self { path: display.into_boxed_str(), name_start }
     }
@@ -127,6 +127,21 @@ fn name_contains(name: &str, query: &str) -> bool {
         || (!query.is_ascii() && name.to_lowercase().contains(&query.to_lowercase()))
 }
 
+// canonicalize() uses verbatim paths on Windows. Show ordinary Explorer paths.
+fn display_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(network) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{network}");
+        }
+        if let Some(local) = path.strip_prefix(r"\\?\") {
+            return local.to_owned();
+        }
+    }
+    path.into_owned()
+}
+
 #[cfg(windows)]
 fn is_reparse_point(path: &Path) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -175,6 +190,13 @@ mod tests {
         assert_eq!(catalog.search("example.txt", 10).len(), 1);
         assert!(!catalog.summary().truncated);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explorer_paths_hide_verbatim_prefix() {
+        assert_eq!(display_path(Path::new(r"\\?\C:\Search\file.txt")), r"C:\Search\file.txt");
+        assert_eq!(display_path(Path::new(r"\\?\UNC\server\share\file.txt")), r"\\server\share\file.txt");
     }
 
     #[test]
