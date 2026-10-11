@@ -110,7 +110,7 @@ pub fn scan_with_progress(
         drop(tx);
         let mut summary = ScanSummary::default();
         let mut error = None;
-        for batch in rx {
+        for batch in rx.iter() {
             summary.directories += 1;
             progress.directories.fetch_add(1, Ordering::Relaxed);
             if batch.skipped {
