@@ -204,7 +204,7 @@ mod tests {
         }));
         // Runner stdin/stdout may be redirected. Bind output to the new
         // console before testing the same input setup used by the app.
-        let output = OpenOptions::new().write(true).open("CONOUT$").unwrap();
+        let output = OpenOptions::new().read(true).write(true).open("CONOUT$").unwrap();
         unsafe { assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, output.as_raw_handle()), 0); }
         let terminal = Terminal::enter().unwrap();
         let writer = OpenOptions::new().write(true).open("CONIN$").unwrap();
