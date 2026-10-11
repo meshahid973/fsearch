@@ -15,6 +15,7 @@ use win32::*;
 const ROOT_ID: usize = 101;
 const INDEX_ID: usize = 102;
 const SEARCH_ID: usize = 103;
+const RESULTS_ID: usize = 104;
 const SEARCH_TIMER: usize = 1;
 const SCAN_READY: u32 = WM_APP + 1;
 const RESULTS_LIMIT: usize = 200;
@@ -74,7 +75,7 @@ pub fn run(root: PathBuf) -> Result<(), String> {
             WS_CHILD | WS_VISIBLE);
         let search = control(hwnd, instance, "EDIT", "", SEARCH_ID,
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL);
-        let results = control(hwnd, instance, "LISTBOX", "", 0,
+        let results = control(hwnd, instance, "LISTBOX", "", RESULTS_ID,
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER);
         let status = control(hwnd, instance, "STATIC", "Ready", 0, WS_CHILD | WS_VISIBLE);
 
@@ -224,6 +225,29 @@ fn show_results(app: &App) {
     }
 }
 
+fn reveal_selected(app: &App) {
+    unsafe {
+        let selected = SendMessageW(app.results, LB_GETCURSEL, 0, 0);
+        if selected < 0 {
+            return;
+        }
+        let length = SendMessageW(app.results, LB_GETTEXTLEN, selected as usize, 0);
+        if !(1..=32768).contains(&length) {
+            return;
+        }
+        let mut text = vec![0u16; length as usize + 1];
+        SendMessageW(app.results, LB_GETTEXT, selected as usize, text.as_mut_ptr() as isize);
+        let path = String::from_utf16_lossy(&text[..length as usize]);
+        if let Err(error) = std::process::Command::new("explorer.exe")
+            .arg("/select,")
+            .arg(path)
+            .spawn()
+        {
+            status(app, &format!("Could not open Explorer: {error}"));
+        }
+    }
+}
+
 unsafe extern "system" fn window_proc(hwnd: Window, msg: u32, wparam: usize, lparam: isize) -> isize {
     unsafe {
         match msg {
@@ -242,6 +266,8 @@ unsafe extern "system" fn window_proc(hwnd: Window, msg: u32, wparam: usize, lpa
                     } else if id == SEARCH_ID && event == EN_CHANGE {
                         KillTimer(hwnd, SEARCH_TIMER);
                         SetTimer(hwnd, SEARCH_TIMER, 120, None);
+                    } else if id == RESULTS_ID && event == LBN_DBLCLK {
+                        reveal_selected(app);
                     }
                 }
                 0

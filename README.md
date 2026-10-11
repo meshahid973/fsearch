@@ -23,6 +23,7 @@ For the console version:
 ## What works now (Phase 1)
 
 - Native Win32 GUI with editable scan root, search box and results.
+- Double-click a result to reveal it in Windows Explorer.
 - Background directory scan; the UI remains responsive while indexing.
 - Case-insensitive ASCII filename substring matching.
 - Scans accessible subdirectories without following Windows directory reparse points.

@@ -61,6 +61,10 @@ pub const WM_APP: u32 = 0x8000;
 pub const GWLP_USERDATA: i32 = -21;
 pub const EN_CHANGE: usize = 0x0300;
 pub const BN_CLICKED: usize = 0;
+pub const LBN_DBLCLK: usize = 2;
+pub const LB_GETCURSEL: u32 = 0x0188;
+pub const LB_GETTEXT: u32 = 0x0189;
+pub const LB_GETTEXTLEN: u32 = 0x018A;
 pub const LB_ADDSTRING: u32 = 0x0180;
 pub const LB_RESETCONTENT: u32 = 0x0184;
 
