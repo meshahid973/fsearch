@@ -150,3 +150,75 @@ impl Drop for Terminal {
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEventKind};
+    use std::fs::OpenOptions;
+
+    #[repr(C)]
+    struct SyntheticKey {
+        kind: u16,
+        padding: u16,
+        pressed: i32,
+        repeat: u16,
+        virtual_key: u16,
+        scan_code: u16,
+        character: u16,
+        modifiers: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WriteConsoleInputW(handle: Handle, events: *const SyntheticKey, count: u32, written: *mut u32) -> i32;
+    }
+
+    #[test]
+    fn reads_key_from_new_console() {
+        const CHILD_ENV: &str = "FSEARCH_CONSOLE_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("console::tests::reads_key_from_new_console")
+                .env(CHILD_ENV, "1")
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .status()
+                .unwrap();
+            assert!(child.success(), "new console failed to read injected key");
+            return;
+        }
+
+        // Runner stdin/stdout may be redirected. Bind output to the new
+        // console before testing the same input setup used by the app.
+        let output = OpenOptions::new().write(true).open("CONOUT$").unwrap();
+        unsafe { assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, output.as_raw_handle()), 0); }
+        let terminal = Terminal::enter().unwrap();
+        let writer = OpenOptions::new().write(true).open("CONIN$").unwrap();
+        let event = SyntheticKey {
+            kind: 1,
+            padding: 0,
+            pressed: 1,
+            repeat: 1,
+            virtual_key: 0x41,
+            scan_code: 0,
+            character: b'a' as u16,
+            modifiers: 0,
+        };
+        let mut written = 0;
+        unsafe {
+            assert_ne!(WriteConsoleInputW(writer.as_raw_handle(), &event, 1, &mut written), 0);
+        }
+        assert_eq!(written, 1);
+
+        for _ in 0..10 {
+            if let Some(Event::Key(key)) = terminal.read_timeout(100).unwrap() {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('a') {
+                    return;
+                }
+            }
+        }
+        panic!("console key event was not delivered");
+    }
+}
