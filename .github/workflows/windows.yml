@@ -28,6 +28,6 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $first.Count -ne 1) { throw "Initial search failed" }
           Set-Content -Path (Join-Path $root "fsearch-unique-beta.txt") -Value "test"
           $old = & .\target\release\fsearch.exe "fsearch-unique-beta" --root $root 2>$null
-          if ($LASTEXITCODE -ne 0 -or @($old).Count -ne 0) { throw "Saved index wasn't reused" }
+          if ($LASTEXITCODE -ne 0 -or $null -ne $old) { throw "Saved index wasn't reused" }
           $new = & .\target\release\fsearch.exe "fsearch-unique-beta" --root $root --reindex 2>$null
           if ($LASTEXITCODE -ne 0 -or @($new).Count -ne 1) { throw "Refresh failed" }
