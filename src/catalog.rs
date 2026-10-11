@@ -36,6 +36,10 @@ impl IndexProgress {
         self.walk.cancelled.store(true, AtomicOrdering::Relaxed);
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.walk.cancelled.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> ProgressSnapshot {
         ProgressSnapshot {
             entries: self.walk.entries.load(AtomicOrdering::Relaxed),
@@ -157,13 +161,19 @@ impl Catalog {
         };
         // A missing or corrupt accelerator must never make the working name
         // catalog unavailable. Queries can fall back to the original scan.
-        catalog.lookup = Lookup::open_or_build(file, count, |id| {
+        match Lookup::open_or_build(file, count, |id| {
             catalog.path_at(id).map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p))
         }, || {
             if let Some(progress) = progress {
                 progress.phase.store(5, AtomicOrdering::Relaxed);
             }
-        }).ok();
+        }, || progress.is_some_and(IndexProgress::is_cancelled)) {
+            Ok(lookup) => catalog.lookup = Some(lookup),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+            // Missing disk space or an invalid optional lookup must not
+            // prevent searching the already validated file catalog.
+            Err(_) => {}
+        }
         Ok(catalog)
     }
 

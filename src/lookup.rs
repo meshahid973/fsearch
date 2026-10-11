@@ -29,6 +29,7 @@ impl Lookup {
         count: usize,
         mut name_at: impl FnMut(usize) -> Option<&'a str>,
         on_build: impl FnOnce(),
+        mut cancelled: impl FnMut() -> bool,
     ) -> io::Result<Self> {
         let meta = fs::metadata(source)?;
         let source_size = meta.len();
@@ -44,6 +45,9 @@ impl Lookup {
         let mut grams: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         let mut unique = Vec::new();
         for id in 0..count {
+            if id % 2048 == 0 && cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "lookup preparation cancelled"));
+            }
             let Some(name) = name_at(id) else { continue };
             if !name.is_ascii() {
                 grams.entry(UNICODE_GRAM).or_default().push(id as u32);
@@ -65,6 +69,9 @@ impl Lookup {
 
         let path_tmp = source.with_extension(format!("{}.lookup-tmp", std::process::id()));
         let result = (|| -> io::Result<()> {
+            if cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "lookup preparation cancelled"));
+            }
             let mut out = BufWriter::new(File::create(&path_tmp)?);
             out.write_all(MAGIC)?;
             out.write_all(&source_size.to_le_bytes())?;
@@ -79,6 +86,9 @@ impl Lookup {
                 pos += postings.len() as u64;
             }
             for postings in grams.values() {
+                if cancelled() {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "lookup preparation cancelled"));
+                }
                 for id in postings {
                     out.write_all(&id.to_le_bytes())?;
                 }
