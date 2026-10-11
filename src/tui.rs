@@ -120,7 +120,10 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
             redraw = true;
         }
         if redraw {
-            draw(term, out, &query, &hits, selected, elapsed, summary, cached, &roots, pending, accelerated, &mut history, &mut screen_state)?;
+            draw(term, out, DrawModel {
+                query: &query, hits: &hits, selected, duration: elapsed,
+                info: summary, cached, roots: &roots, pending, accelerated,
+            }, &mut history, &mut screen_state)?;
             redraw = false;
         }
 
@@ -151,10 +154,8 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 redraw = true;
             }
             KeyCode::Enter => {
-                if !pending {
-                    if let Some(path) = hits.get(selected) {
-                        let _ = reveal(path);
-                    }
+                if !pending && let Some(path) = hits.get(selected) {
+                    let _ = reveal(path);
                 }
             }
             KeyCode::Char('r' | 'R') if event.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -291,21 +292,30 @@ fn result_limit(height: usize) -> usize {
     }
 }
 
-fn draw(
-    term: &Terminal,
-    out: &mut impl Write,
-    query: &str,
-    hits: &[String],
+/// Everything needed to render one immutable search frame.
+#[derive(Clone, Copy)]
+struct DrawModel<'a> {
+    query: &'a str,
+    hits: &'a [String],
     selected: usize,
     duration: Duration,
     info: ScanSummary,
     cached: bool,
-    roots: &[PathBuf],
+    roots: &'a [PathBuf],
     pending: bool,
     accelerated: bool,
+}
+
+fn draw(
+    term: &Terminal,
+    out: &mut impl Write,
+    frame: DrawModel<'_>,
     history: &mut LatencyHistory,
     screen: &mut ScreenState,
 ) -> io::Result<()> {
+    let DrawModel {
+        query, hits, selected, duration, info, cached, roots, pending, accelerated,
+    } = frame;
     let (width, height) = term.dimensions();
     let width = width.min(240);
     let margin = if width > 70 { "    " } else { "  " };

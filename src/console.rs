@@ -225,10 +225,11 @@ mod tests {
         assert_eq!(written, 1);
 
         for _ in 0..10 {
-            if let Some(Event::Key(key)) = terminal.read_timeout(100).unwrap() {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('a') {
-                    return;
-                }
+            if let Some(Event::Key(key)) = terminal.read_timeout(100).unwrap()
+                && key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Char('a')
+            {
+                return;
             }
         }
         panic!("console key event was not delivered");

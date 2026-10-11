@@ -84,7 +84,7 @@ impl LatencyHistory {
         }
         values[..self.len].sort_unstable_by(f64::total_cmp);
         let middle = self.len / 2;
-        self.cached_median = Some(if self.len % 2 == 0 {
+        self.cached_median = Some(if self.len.is_multiple_of(2) {
             (values[middle - 1] + values[middle]) / 2.0
         } else {
             values[middle]
@@ -101,7 +101,7 @@ impl LatencyHistory {
 
         for i in start..self.len {
             let value = self.sample(i);
-            let level = if max - min < f64::EPSILON {
+            let level = if (max - min).abs() < f64::EPSILON {
                 0
             } else {
                 (((value - min) / (max - min)) * (BARS.len() - 1) as f64)
