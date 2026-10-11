@@ -3,7 +3,7 @@
 
 #[cfg(windows)]
 fn main() {
-    if let Err(error) = fsearch::gui::run(fsearch::default_root()) {
+    if let Err(error) = fsearch::gui::run() {
         fsearch::gui::show_error(&error);
     }
 }

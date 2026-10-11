@@ -1,48 +1,49 @@
-//! Native Windows desktop UI: directory, search box, results, and progress.
-//!
-//! Scans run on a worker thread. UI updates only happen on the window thread;
-//! workers communicate through a shared slot and one posted Win32 message.
+//! Native Windows search window, built with standard Windows controls.
+//! A worker loads or rebuilds the index while the UI stays responsive.
 
 mod win32;
 
-use crate::{Catalog, DEFAULT_ENTRY_LIMIT};
+use crate::{Catalog, DEFAULT_ENTRY_LIMIT, default_roots};
 use std::mem;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use win32::*;
 
-const ROOT_ID: usize = 101;
-const INDEX_ID: usize = 102;
-const SEARCH_ID: usize = 103;
+const SEARCH_ID: usize = 101;
+const ROOTS_ID: usize = 102;
+const REFRESH_ID: usize = 103;
 const RESULTS_ID: usize = 104;
 const SEARCH_TIMER: usize = 1;
 const SCAN_READY: u32 = WM_APP + 1;
 const RESULTS_LIMIT: usize = 200;
 
-type ScanResult = Result<Catalog, String>;
+type ScanResult = Result<(Catalog, bool), String>;
 type ResultSlot = Arc<Mutex<Option<ScanResult>>>;
 
 struct App {
-    root: Window,
-    index_button: Window,
     search: Window,
+    roots: Window,
+    refresh: Window,
     results: Window,
     status: Window,
     catalog: Option<Catalog>,
+    matches: Vec<String>,
     result_slot: ResultSlot,
     scanning: bool,
+    summary: String,
 }
 
-/// Windows GUI. Search data is kept in-process only for this first milestone.
-pub fn run(root: PathBuf) -> Result<(), String> {
+pub fn run() -> Result<(), String> {
     unsafe {
+        if InitCommonControlsEx(&InitControls { size: mem::size_of::<InitControls>() as u32, classes: 1 }) == 0 {
+            return Err("could not initialize Windows controls".into());
+        }
         let instance = GetModuleHandleW(ptr::null());
         if instance.is_null() {
             return Err("could not get Windows module handle".into());
         }
-
-        let name = wide("FSearchNativeWindow");
+        let class_name = wide("FSearchNativeWindow");
         let class = WindowClass {
             style: 0,
             procedure: Some(window_proc),
@@ -53,52 +54,64 @@ pub fn run(root: PathBuf) -> Result<(), String> {
             cursor: LoadCursorW(ptr::null_mut(), 32512usize as *const u16),
             background: (COLOR_WINDOW + 1) as Handle,
             menu_name: ptr::null(),
-            class_name: name.as_ptr(),
+            class_name: class_name.as_ptr(),
         };
         if RegisterClassW(&class) == 0 {
-            return Err("could not register the FSearch window".into());
+            return Err("could not register window".into());
         }
-
-        let title = wide("FSearch - Windows");
+        let title = wide("FSearch");
         let hwnd = CreateWindowExW(
-            0, name.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT, CW_USEDEFAULT, 900, 620,
+            0, class_name.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT, CW_USEDEFAULT, 950, 620,
             ptr::null_mut(), ptr::null_mut(), instance, ptr::null(),
         );
         if hwnd.is_null() {
-            return Err("could not create the FSearch window".into());
+            return Err("could not create window".into());
         }
 
-        let root_edit = control(hwnd, instance, "EDIT", &root.to_string_lossy(), ROOT_ID,
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL);
-        let index_button = control(hwnd, instance, "BUTTON", "Index", INDEX_ID,
-            WS_CHILD | WS_VISIBLE);
         let search = control(hwnd, instance, "EDIT", "", SEARCH_ID,
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL);
-        let results = control(hwnd, instance, "LISTBOX", "", RESULTS_ID,
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER);
-        let status = control(hwnd, instance, "STATIC", "Ready", 0, WS_CHILD | WS_VISIBLE);
-
-        if [root_edit, index_button, search, results, status].iter().any(|h| h.is_null()) {
-            return Err("could not create native controls".into());
+        let default = default_roots().iter().map(|r| r.to_string_lossy().into_owned())
+            .collect::<Vec<_>>().join(";");
+        let roots = control(hwnd, instance, "EDIT", &default, ROOTS_ID,
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL);
+        let refresh = control(hwnd, instance, "BUTTON", "Refresh", REFRESH_ID,
+            WS_CHILD | WS_VISIBLE);
+        let results = control(hwnd, instance, "SysListView32", "", RESULTS_ID,
+            WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS);
+        let status = control(hwnd, instance, "STATIC", "Loading index...", 0, WS_CHILD | WS_VISIBLE);
+        if [search, roots, refresh, results, status].iter().any(|h| h.is_null()) {
+            return Err("could not create search controls".into());
         }
 
+        let font = GetStockObject(17); // DEFAULT_GUI_FONT
+        for control in [search, roots, refresh, results, status] {
+            SendMessageW(control, WM_SETFONT, font as usize, 1);
+        }
+        SendMessageW(results, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
+            (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP) as isize);
+        add_column(results, 0, "Name", 310);
+        add_column(results, 1, "Location", 580);
+        let cue = wide("Search files and folders");
+        SendMessageW(search, 0x1501, 1, cue.as_ptr() as isize); // EM_SETCUEBANNER
+
         let app = Box::new(App {
-            root: root_edit,
-            index_button,
-            search,
-            results,
-            status,
+            search, roots, refresh, results, status,
             catalog: None,
+            matches: Vec::new(),
             result_slot: Arc::new(Mutex::new(None)),
             scanning: false,
+            summary: String::new(),
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
-        layout(hwnd, 900, 580);
+        let mut rect: Rect = mem::zeroed();
+        GetClientRect(hwnd, &mut rect);
+        layout(hwnd, rect.right - rect.left, rect.bottom - rect.top);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        SetFocus(search);
         if let Some(app) = state(hwnd) {
-            start_scan(hwnd, app);
+            start_scan(hwnd, app, false);
         }
 
         let mut message: Message = mem::zeroed();
@@ -127,7 +140,7 @@ unsafe fn control(parent: Window, instance: Instance, class: &str, label: &str, 
 }
 
 fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
+    value.encode_utf16().chain(Some(0)).collect()
 }
 
 unsafe fn state(hwnd: Window) -> Option<&'static mut App> {
@@ -135,16 +148,27 @@ unsafe fn state(hwnd: Window) -> Option<&'static mut App> {
     unsafe { pointer.as_mut() }
 }
 
+fn add_column(hwnd: Window, position: usize, label: &str, width: i32) {
+    let mut text = wide(label);
+    let mut column: Column = unsafe { mem::zeroed() };
+    column.mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT;
+    column.width = width;
+    column.text = text.as_mut_ptr();
+    unsafe { SendMessageW(hwnd, LVM_INSERTCOLUMNW, position, &column as *const Column as isize); }
+}
+
 unsafe fn layout(hwnd: Window, width: i32, height: i32) {
     let Some(app) = (unsafe { state(hwnd) }) else { return };
-    let w = width.max(400);
-    let h = height.max(250);
+    let w = width.max(420);
+    let h = height.max(270);
     unsafe {
-        MoveWindow(app.root, 12, 12, w - 116, 30, 1);
-        MoveWindow(app.index_button, w - 94, 12, 82, 30, 1);
-        MoveWindow(app.search, 12, 52, w - 24, 34, 1);
-        MoveWindow(app.results, 12, 96, w - 24, h - 134, 1);
-        MoveWindow(app.status, 12, h - 30, w - 24, 22, 1);
+        MoveWindow(app.search, 14, 14, w - 28, 36, 1);
+        MoveWindow(app.roots, 14, 61, w - 120, 29, 1);
+        MoveWindow(app.refresh, w - 96, 61, 82, 29, 1);
+        MoveWindow(app.results, 14, 105, w - 28, h - 149, 1);
+        MoveWindow(app.status, 16, h - 30, w - 32, 20, 1);
+        SendMessageW(app.results, LVM_SETCOLUMNWIDTH, 0, (w / 3).max(180) as isize);
+        SendMessageW(app.results, LVM_SETCOLUMNWIDTH, 1, (w - (w / 3).max(180) - 52).max(180) as isize);
     }
 }
 
@@ -161,90 +185,105 @@ fn status(app: &App, message: &str) {
     unsafe { SetWindowTextW(app.status, wide(message).as_ptr()); }
 }
 
-fn start_scan(hwnd: Window, app: &mut App) {
+fn start_scan(hwnd: Window, app: &mut App, refresh: bool) {
     if app.scanning {
         return;
     }
-    let root = PathBuf::from(read_text(app.root).trim());
-    if root.as_os_str().is_empty() {
-        status(app, "Enter a directory to index");
+    let roots = read_text(app.roots)
+        .split(';')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        status(app, "Enter one or more folders, separated by semicolons");
         return;
     }
     app.catalog = None;
+    app.matches.clear();
     app.scanning = true;
     unsafe {
-        EnableWindow(app.index_button, 0);
-        SendMessageW(app.results, LB_RESETCONTENT, 0, 0);
+        EnableWindow(app.refresh, 0);
+        SendMessageW(app.results, LVM_DELETEALLITEMS, 0, 0);
     }
-    status(app, &format!("Indexing {} ...", root.display()));
+    status(app, if refresh { "Updating index..." } else { "Opening index..." });
+
     let shared = Arc::clone(&app.result_slot);
-    // Native HWND pointers are not Send. Carry the opaque handle value only.
     let window_id = hwnd as usize;
     std::thread::spawn(move || {
-        let result = Catalog::scan(&root, DEFAULT_ENTRY_LIMIT).map_err(|e| e.to_string());
+        let result = Catalog::open_or_build(&roots, DEFAULT_ENTRY_LIMIT, refresh)
+            .map_err(|e| e.to_string());
         if let Ok(mut slot) = shared.lock() {
             *slot = Some(result);
         }
-        unsafe {
-            PostMessageW(window_id as Window, SCAN_READY, 0, 0);
-        }
+        unsafe { PostMessageW(window_id as Window, SCAN_READY, 0, 0); }
     });
 }
 
 fn scan_ready(app: &mut App) {
     let result = app.result_slot.lock().ok().and_then(|mut slot| slot.take());
     app.scanning = false;
-    unsafe { EnableWindow(app.index_button, 1); }
+    unsafe { EnableWindow(app.refresh, 1); }
     match result {
-        Some(Ok(catalog)) => {
-            let summary = catalog.summary();
+        Some(Ok((catalog, cached))) => {
+            let s = catalog.summary();
+            app.summary = format!(
+                "{}  |  {} items  |  {} folders  |  {} skipped{}",
+                if cached { "Saved index" } else { "Indexed" },
+                s.entries, s.directories, s.skipped,
+                if s.truncated { "  |  Limit reached" } else { "" },
+            );
             app.catalog = Some(catalog);
-            status(app, &format!(
-                "{} files/folders indexed  |  {} directories  |  {} skipped{}",
-                summary.entries, summary.directories, summary.skipped,
-                if summary.truncated { "  |  entry limit reached" } else { "" },
-            ));
             show_results(app);
         }
-        Some(Err(error)) => status(app, &format!("Index failed: {error}")),
-        None => status(app, "Indexing result unavailable"),
+        Some(Err(error)) => status(app, &format!("Index error: {error}")),
+        None => status(app, "Index unavailable"),
     }
 }
 
-fn show_results(app: &App) {
-    unsafe { SendMessageW(app.results, LB_RESETCONTENT, 0, 0); }
+fn show_results(app: &mut App) {
+    unsafe { SendMessageW(app.results, LVM_DELETEALLITEMS, 0, 0); }
+    app.matches.clear();
     let Some(catalog) = &app.catalog else { return };
     let query = read_text(app.search);
-    let results = catalog.search(&query, RESULTS_LIMIT);
-    for path in &results {
-        let text = wide(path);
-        unsafe { SendMessageW(app.results, LB_ADDSTRING, 0, text.as_ptr() as isize); }
+    if query.trim().is_empty() {
+        status(app, &app.summary);
+        return;
     }
-    if !query.trim().is_empty() {
-        status(app, &format!("Showing {} matches (maximum {})", results.len(), RESULTS_LIMIT));
+    let found = catalog.search(&query, RESULTS_LIMIT);
+    app.matches = found.into_iter().map(str::to_string).collect();
+    for (row, path) in app.matches.iter().enumerate() {
+        let split = path.rfind(['\\', '/']).unwrap_or(0);
+        let (folder, name) = if split == 0 { ("", path.as_str()) } else { (&path[..split], &path[split + 1..]) };
+        insert_result(app.results, row as i32, name, folder);
     }
+    status(app, &format!("{} results  |  {}", app.matches.len(), app.summary));
+}
+
+fn insert_result(hwnd: Window, row: i32, name: &str, folder: &str) {
+    let mut title = wide(name);
+    let mut item: Item = unsafe { mem::zeroed() };
+    item.mask = LVIF_TEXT;
+    item.row = row;
+    item.text = title.as_mut_ptr();
+    unsafe { SendMessageW(hwnd, LVM_INSERTITEMW, 0, &item as *const Item as isize); }
+
+    let mut location = wide(folder);
+    item.column = 1;
+    item.text = location.as_mut_ptr();
+    unsafe { SendMessageW(hwnd, LVM_SETITEMTEXTW, row as usize, &item as *const Item as isize); }
 }
 
 fn reveal_selected(app: &App) {
-    unsafe {
-        let selected = SendMessageW(app.results, LB_GETCURSEL, 0, 0);
-        if selected < 0 {
-            return;
-        }
-        let length = SendMessageW(app.results, LB_GETTEXTLEN, selected as usize, 0);
-        if !(1..=32768).contains(&length) {
-            return;
-        }
-        let mut text = vec![0u16; length as usize + 1];
-        SendMessageW(app.results, LB_GETTEXT, selected as usize, text.as_mut_ptr() as isize);
-        let path = String::from_utf16_lossy(&text[..length as usize]);
-        if let Err(error) = std::process::Command::new("explorer.exe")
-            .arg("/select,")
-            .arg(path)
-            .spawn()
-        {
-            status(app, &format!("Could not open Explorer: {error}"));
-        }
+    let index = unsafe { SendMessageW(app.results, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED) };
+    if index < 0 {
+        return;
+    }
+    let Some(path) = app.matches.get(index as usize) else { return };
+    if let Err(error) = std::process::Command::new("explorer.exe")
+        .arg("/select,").arg(path).spawn()
+    {
+        status(app, &format!("Explorer error: {error}"));
     }
 }
 
@@ -261,13 +300,22 @@ unsafe extern "system" fn window_proc(hwnd: Window, msg: u32, wparam: usize, lpa
                 if let Some(app) = state(hwnd) {
                     let id = wparam & 0xffff;
                     let event = wparam >> 16;
-                    if id == INDEX_ID && event == BN_CLICKED {
-                        start_scan(hwnd, app);
+                    if id == REFRESH_ID && event == BN_CLICKED {
+                        start_scan(hwnd, app, true);
                     } else if id == SEARCH_ID && event == EN_CHANGE {
                         KillTimer(hwnd, SEARCH_TIMER);
-                        SetTimer(hwnd, SEARCH_TIMER, 120, None);
-                    } else if id == RESULTS_ID && event == LBN_DBLCLK {
-                        reveal_selected(app);
+                        SetTimer(hwnd, SEARCH_TIMER, 90, None);
+                    }
+                }
+                0
+            }
+            WM_NOTIFY => {
+                if ! (lparam as *const Notification).is_null() {
+                    let notification = &*(lparam as *const Notification);
+                    if notification.id == RESULTS_ID && notification.code == NM_DBLCLK {
+                        if let Some(app) = state(hwnd) {
+                            reveal_selected(app);
+                        }
                     }
                 }
                 0
@@ -303,7 +351,5 @@ unsafe extern "system" fn window_proc(hwnd: Window, msg: u32, wparam: usize, lpa
 }
 
 pub fn show_error(error: &str) {
-    unsafe {
-        MessageBoxW(ptr::null_mut(), wide(error).as_ptr(), wide("FSearch").as_ptr(), 0x10);
-    }
+    unsafe { MessageBoxW(ptr::null_mut(), wide(error).as_ptr(), wide("FSearch").as_ptr(), 0x10); }
 }
