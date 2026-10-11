@@ -5,53 +5,145 @@ use crate::ScanSummary;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::sync::mpsc;
+use std::thread;
+
+/// Counters updated during the initial scan. Readers never wait on the scanner.
+#[derive(Default)]
+pub struct Progress {
+    pub entries: AtomicUsize,
+    pub directories: AtomicUsize,
+    pub skipped: AtomicUsize,
+}
+
+struct Work {
+    pending: VecDeque<PathBuf>,
+    unfinished: usize,
+    closed: bool,
+}
+
+struct Batch {
+    entries: Vec<(PathBuf, bool, bool)>,
+    skipped: bool,
+}
+
+/// Enumerate whole directory trees with a small, fixed number of workers.
+/// Batches and file writes are bounded; only pending directories are queued.
 pub fn scan(
     roots: &[PathBuf],
     limit: usize,
+    on_entry: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<ScanSummary> {
+    scan_with_progress(roots, limit, &Progress::default(), on_entry)
+}
+
+pub fn scan_with_progress(
+    roots: &[PathBuf],
+    limit: usize,
+    progress: &Progress,
     mut on_entry: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<ScanSummary> {
-    if limit == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "entry limit must be positive"));
+    if limit == 0 || roots.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "roots and limit must be nonempty"));
     }
-    if roots.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no search roots"));
-    }
-    let mut summary = ScanSummary::default();
-    let mut pending = Vec::from(roots);
     for root in roots {
         if !root.is_dir() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not a directory: {}", root.display())));
         }
     }
-    while let Some(dir) = pending.pop() {
-        summary.directories += 1;
-        let result = list_directory(&dir, |path, directory, reparse| {
-            // Do not mistake index-write failures for unreadable folders.
-            on_entry(&path).map_err(|error| io::Error::other(format!("index write failed: {error}")))?;
-            summary.entries += 1;
-            if summary.entries >= limit {
-                summary.truncated = true;
-                return Ok(false);
-            }
-            if directory && !reparse {
-                pending.push(path);
-            }
-            Ok(true)
-        });
-        match result {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied
-                || error.kind() == io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(5) => {
+    let queue = (Mutex::new(Work {
+        pending: roots.iter().cloned().collect(),
+        unfinished: roots.len(),
+        closed: false,
+    }), Condvar::new());
+    let (tx, rx) = mpsc::sync_channel::<Batch>(12);
+    let count = thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 6);
+    thread::scope(|scope| {
+        let queue = &queue;
+        for _ in 0..count {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                loop {
+                    let dir = {
+                        let (lock, cv) = queue;
+                        let mut work = lock.lock().unwrap();
+                        while work.pending.is_empty() && !work.closed {
+                            work = cv.wait(work).unwrap();
+                        }
+                        if work.closed {
+                            break;
+                        }
+                        work.pending.pop_front().unwrap()
+                    };
+                    let mut entries = Vec::new();
+                    let result = list_directory(&dir, |path, directory, reparse| {
+                        entries.push((path, directory, reparse));
+                        Ok(true)
+                    });
+                    let skipped = result.is_err();
+                    {
+                        let (lock, cv) = queue;
+                        let mut work = lock.lock().unwrap();
+                        if !work.closed {
+                            for (path, directory, reparse) in &entries {
+                                if *directory && !*reparse {
+                                    work.pending.push_back(path.clone());
+                                    work.unfinished += 1;
+                                }
+                            }
+                        }
+                        work.unfinished -= 1;
+                        if work.unfinished == 0 {
+                            work.closed = true;
+                        }
+                        cv.notify_all();
+                    }
+                    if tx.send(Batch { entries, skipped }).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut summary = ScanSummary::default();
+        let mut error = None;
+        for batch in rx {
+            summary.directories += 1;
+            progress.directories.fetch_add(1, Ordering::Relaxed);
+            if batch.skipped {
                 summary.skipped += 1;
+                progress.skipped.fetch_add(1, Ordering::Relaxed);
             }
-            Err(error) => return Err(error),
+            for (path, _, _) in batch.entries {
+                if let Err(err) = on_entry(&path) {
+                    error = Some(err);
+                    break;
+                }
+                summary.entries += 1;
+                progress.entries.fetch_add(1, Ordering::Relaxed);
+                if summary.entries >= limit {
+                    summary.truncated = true;
+                    break;
+                }
+            }
+            if error.is_some() || summary.truncated {
+                break;
+            }
         }
-        if summary.truncated {
-            break;
+        // Close before joining: blocked workers must stop sending batches.
+        drop(rx);
+        {
+            let (lock, cv) = queue;
+            let mut work = lock.lock().unwrap();
+            work.closed = true;
+            work.pending.clear();
+            cv.notify_all();
         }
-    }
-    Ok(summary)
+        if let Some(err) = error { Err(err) } else { Ok(summary) }
+    })
 }
 
 /// Visit one folder. Returning false from the callback stops enumeration.
