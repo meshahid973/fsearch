@@ -3,7 +3,8 @@
 //! Each key updates the results from the saved index. The input reader
 //! blocks while idle: there is no polling or background render loop.
 
-use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, ScanSummary};
+use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, IndexProgress, ScanSummary};
+use std::sync::{Arc, mpsc};
 use crate::console::Terminal;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -29,9 +30,10 @@ pub fn run(roots: Vec<PathBuf>, force_refresh: bool) -> io::Result<()> {
 }
 
 fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_refresh: bool) -> io::Result<()> {
-    show_message(term, out, "Loading file index...")?;
-    let (mut catalog, mut cached) = Catalog::open_or_build(&roots, DEFAULT_ENTRY_LIMIT, force_refresh)?;
     let mut query = String::new();
+    let Some((mut catalog, mut cached)) = load_index(term, out, &roots, force_refresh, &mut query)? else {
+        return Ok(());
+    };
     let mut selected = 0usize;
     let mut pending_high_surrogate: Option<u16> = None;
 
@@ -62,12 +64,12 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 }
             }
             0x52 if event.key.modifiers & 0x000c != 0 => {
-                show_message(term, out, "Refreshing file index...")?;
-                // Windows cannot always replace an open memory-mapped file.
-                // Release all result references and the old map first.
+                // Release the mapped file before replacing the index on disk.
                 drop(hits);
                 drop(catalog);
-                let (updated, from_disk) = Catalog::open_or_build(&roots, DEFAULT_ENTRY_LIMIT, true)?;
+                let Some((updated, from_disk)) = load_index(term, out, &roots, true, &mut query)? else {
+                    return Ok(());
+                };
                 catalog = updated;
                 cached = from_disk;
                 selected = 0;
@@ -91,6 +93,91 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                         query.push(character);
                         selected = 0;
                     }
+                }
+            }
+        }
+    }
+}
+
+/// The initial disk crawl is asynchronous. The UI remains responsive and
+/// shows counters instead of a static loading screen.
+fn load_index(
+    term: &Terminal,
+    out: &mut impl Write,
+    roots: &[PathBuf],
+    refresh: bool,
+    query: &mut String,
+) -> io::Result<Option<(Catalog, bool)>> {
+    let progress = Arc::new(IndexProgress::default());
+    let worker_progress = Arc::clone(&progress);
+    let worker_roots = roots.to_vec();
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = Catalog::open_or_build_with_progress(
+            &worker_roots,
+            DEFAULT_ENTRY_LIMIT,
+            refresh,
+            &worker_progress,
+        );
+        let _ = tx.send(result);
+    });
+
+    let mut last = String::new();
+    let mut pending_high = None;
+    loop {
+        match rx.try_recv() {
+            Ok(Ok(result)) => return Ok(Some(result)),
+            Ok(Err(error)) => return Err(error),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::other("index worker stopped unexpectedly"));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        let snapshot = progress.snapshot();
+        let phase = match snapshot.phase {
+            0 => "Opening saved index",
+            1 => "Scanning files",
+            2 => "Saving index",
+            3 => "Opening new index",
+            _ => "Finishing",
+        };
+        let label = format!(
+            "{phase}...\n\n    {} files  ·  {} folders  ·  {} skipped\n\n    Search: {query}\n\n    Type while indexing  ·  Esc to cancel",
+            number(snapshot.entries),
+            number(snapshot.directories),
+            number(snapshot.skipped),
+        );
+        if label != last {
+            show_message(term, out, &label)?;
+            last = label;
+        }
+        let Some(event) = term.read_timeout(150)? else { continue };
+        if event.event_type != KEY_EVENT || event.key.pressed == 0 { continue }
+        match event.key.virtual_key {
+            0x1B => {
+                progress.cancel();
+                // The worker completes its current directory, drops temporary
+                // files and exits. Keep the terminal responsive while waiting.
+                show_message(term, out, "Stopping index scan...")?;
+                let _ = rx.recv();
+                return Ok(None);
+            }
+            0x08 => { query.pop(); }
+            _ => {
+                let unit = event.key.character;
+                if unit < 0x20 { continue }
+                if (0xD800..=0xDBFF).contains(&unit) {
+                    pending_high = Some(unit);
+                    continue;
+                }
+                let character = if let Some(high) = pending_high.take() {
+                    char::decode_utf16([high, unit]).next().and_then(Result::ok)
+                } else {
+                    char::from_u32(u32::from(unit))
+                };
+                if let Some(character) = character {
+                    if query.chars().count() < 160 { query.push(character); }
                 }
             }
         }
