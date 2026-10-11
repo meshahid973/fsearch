@@ -16,7 +16,7 @@ cargo build --release
 .\target\release\fsearch.exe
 ```
 
-This opens a new terminal window. Type to search, use the arrow keys to select a result, press Enter to reveal it in Explorer, Ctrl+R to rebuild the index, or Esc to quit.
+This opens a new terminal window. The first scan shows its progress, and you can type a search while it runs. Later launches reuse the saved index. Use the arrow keys to select, Enter to reveal a file in Explorer, Ctrl+R to refresh, or Esc to quit.
 
 To use the current terminal instead:
 
@@ -31,7 +31,7 @@ To print search results without opening an interactive window:
 .\target\release\fsearch.exe "readme" --root "D:\"
 ```
 
-The index is saved in `%LOCALAPPDATA%\FSearch`. New and deleted files are picked up when you reindex; automatic live monitoring is not available yet.
+The index is saved in `%LOCALAPPDATA%\FSearch`. FSearch scans mounted fixed drives by default. New or deleted files require a refresh; searching inside file contents is not supported.
 
 ## License
 
