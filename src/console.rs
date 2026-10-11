@@ -186,6 +186,7 @@ mod tests {
                 .arg("--exact")
                 .arg("console::tests::reads_key_from_new_console")
                 .env(CHILD_ENV, "1")
+                .env("FSEARCH_CONSOLE_TEST_LOG", &log_path)
                 .stderr(log)
                 .creation_flags(CREATE_NEW_CONSOLE)
                 .status()
@@ -196,6 +197,11 @@ mod tests {
             return;
         }
 
+        std::panic::set_hook(Box::new(|info| {
+            if let Ok(path) = std::env::var("FSEARCH_CONSOLE_TEST_LOG") {
+                let _ = std::fs::write(path, format!("{info}"));
+            }
+        }));
         // Runner stdin/stdout may be redirected. Bind output to the new
         // console before testing the same input setup used by the app.
         let output = OpenOptions::new().write(true).open("CONOUT$").unwrap();
