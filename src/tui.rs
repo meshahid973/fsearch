@@ -6,7 +6,7 @@
 use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, IndexProgress, ScanSummary};
 use std::sync::{Arc, mpsc};
 use crate::console::Terminal;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -119,7 +119,7 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 return Ok(());
             }
             KeyCode::Backspace => {
-                if query.pop().is_some() { changed = true; }
+                changed = apply_text_key(&mut query, &event);
             }
             KeyCode::Up => {
                 selected = selected.saturating_sub(1);
@@ -149,8 +149,8 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 selected = 0;
                 changed = true;
             }
-            KeyCode::Char(ch) if !event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-                if query.chars().count() < 160 { query.push(ch); changed = true; }
+            KeyCode::Char(_) => {
+                changed = apply_text_key(&mut query, &event);
             }
             _ => {}
         }
@@ -233,12 +233,25 @@ fn load_index(
                 let _ = rx.recv();
                 return Ok(None);
             }
-            KeyCode::Backspace => { query.pop(); }
-            KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-                if query.chars().count() < 160 { query.push(ch); }
+            KeyCode::Backspace | KeyCode::Char(_) => {
+                apply_text_key(query, &key);
             }
             _ => {}
         }
+    }
+}
+
+fn apply_text_key(query: &mut String, event: &KeyEvent) -> bool {
+    match event.code {
+        KeyCode::Backspace => query.pop().is_some(),
+        KeyCode::Char(character)
+            if !event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && query.chars().count() < 160 =>
+        {
+            query.push(character);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -295,7 +308,7 @@ fn draw(
     let foot = "↑↓ select   Enter reveal   Ctrl+R reindex   Esc quit";
     buffer.push_str(&format!("\x1b[{};1H{margin}{GREY}{}{RESET}{BG}", height.saturating_sub(2), shorten(&status, width.saturating_sub(margin.len() + 1))));
     buffer.push_str(&format!("\x1b[{};1H{margin}{GREY}{}{RESET}{BG}", height.saturating_sub(1), shorten(foot, width.saturating_sub(margin.len() + 1))));
-    buffer.push_str(&format!("\x1b[5;{}H\x1b[?25h", margin.len() + 13 + query.chars().count()));
+    buffer.push_str(&format!("\x1b[5;{}H\x1b[?25h", margin.len() + 11 + query.chars().count()));
     out.write_all(buffer.as_bytes())?;
     out.flush()
 }
@@ -342,6 +355,18 @@ fn reveal(path: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keyboard_accepts_text_and_backspace() {
+        let mut query = String::new();
+        assert!(apply_text_key(&mut query, &KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)));
+        assert!(apply_text_key(&mut query, &KeyEvent::new(KeyCode::Char('日'), KeyModifiers::NONE)));
+        assert_eq!(query, "m日");
+        assert!(apply_text_key(&mut query, &KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
+        assert_eq!(query, "m");
+        assert!(!apply_text_key(&mut query, &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)));
+        assert_eq!(query, "m");
+    }
+
     #[test]
     fn formatted_counts() {
         assert_eq!(number(7_643_622), "7,643,622");
