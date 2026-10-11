@@ -26,7 +26,8 @@ pub fn scan(
     while let Some(dir) = pending.pop() {
         summary.directories += 1;
         let result = list_directory(&dir, |path, directory, reparse| {
-            on_entry(&path)?;
+            // Do not mistake index-write failures for unreadable folders.
+            on_entry(&path).map_err(|error| io::Error::other(format!("index write failed: {error}")))?;
             summary.entries += 1;
             if summary.entries >= limit {
                 summary.truncated = true;
