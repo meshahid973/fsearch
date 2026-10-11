@@ -221,6 +221,15 @@ impl Lookup {
                 if let Some(id) = self.posting_id(list, i) { out.push(id); }
             }
         }
+        // Non-ASCII filenames can case-fold to an ASCII spelling. They
+        // must remain candidates even when none of their raw-byte trigrams
+        // match the typo query.
+        if let Some(unicode) = self.postings_for(UNICODE_GRAM) {
+            if budget.saturating_add(unicode.1) > 2_000_000 { return None; }
+            for i in 0..unicode.1 {
+                if let Some(id) = self.posting_id(unicode, i) { out.push(id); }
+            }
+        }
         out.sort_unstable();
         out.dedup();
         Some(out)

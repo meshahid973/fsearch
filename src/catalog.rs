@@ -8,7 +8,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"FSWIN003";
@@ -226,11 +226,11 @@ impl Catalog {
             out.write_all(&0u32.to_le_bytes())?;
             out.write_all(key.as_bytes())?;
             let mut offsets = File::open(&offsets_path)?;
-            io::copy(&mut offsets, &mut out)?;
+            copy_with_cancel(&mut offsets, &mut out, progress)?;
             let mut masks = File::open(&masks_path)?;
-            io::copy(&mut masks, &mut out)?;
+            copy_with_cancel(&mut masks, &mut out, progress)?;
             let mut input = File::open(&spool_path)?;
-            io::copy(&mut input, &mut out)?;
+            copy_with_cancel(&mut input, &mut out, progress)?;
             out.flush()?;
             drop(out);
             drop(input);
@@ -492,6 +492,22 @@ fn filename_mask(text: &str) -> u64 {
 
 fn word64(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?))
+}
+
+/// Copy large index sections in chunks so Esc remains responsive while
+/// the snapshot is being assembled, not just during directory enumeration.
+fn copy_with_cancel(
+    input: &mut impl Read, output: &mut impl Write, progress: &IndexProgress,
+) -> io::Result<()> {
+    let mut block = [0u8; 64 * 1024];
+    loop {
+        if progress.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "indexing cancelled"));
+        }
+        let size = input.read(&mut block)?;
+        if size == 0 { return Ok(()); }
+        output.write_all(&block[..size])?;
+    }
 }
 
 fn word(bytes: &[u8], offset: usize) -> Option<u32> {
