@@ -62,6 +62,83 @@ pub const GWLP_USERDATA: i32 = -21;
 pub const EN_CHANGE: usize = 0x0300;
 pub const BN_CLICKED: usize = 0;
 pub const LBN_DBLCLK: usize = 2;
+pub const WM_NOTIFY: u32 = 0x004e;
+pub const WM_SETFONT: u32 = 0x0030;
+pub const NM_DBLCLK: i32 = -3;
+pub const LVS_REPORT: u32 = 0x0001;
+pub const LVS_SINGLESEL: u32 = 0x0004;
+pub const LVS_SHOWSELALWAYS: u32 = 0x0008;
+pub const LVS_EX_FULLROWSELECT: usize = 0x0000_0020;
+pub const LVS_EX_DOUBLEBUFFER: usize = 0x0001_0000;
+pub const LVS_EX_LABELTIP: usize = 0x0000_4000;
+pub const LVM_FIRST: u32 = 0x1000;
+pub const LVM_DELETEALLITEMS: u32 = LVM_FIRST + 9;
+pub const LVM_GETNEXTITEM: u32 = LVM_FIRST + 12;
+pub const LVM_SETCOLUMNWIDTH: u32 = LVM_FIRST + 30;
+pub const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = LVM_FIRST + 54;
+pub const LVM_INSERTITEMW: u32 = LVM_FIRST + 77;
+pub const LVM_INSERTCOLUMNW: u32 = LVM_FIRST + 97;
+pub const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
+pub const LVIF_TEXT: u32 = 0x0001;
+pub const LVCF_FMT: u32 = 0x0001;
+pub const LVCF_WIDTH: u32 = 0x0002;
+pub const LVCF_TEXT: u32 = 0x0004;
+pub const LVNI_SELECTED: isize = 0x0002;
+
+#[repr(C)]
+pub struct InitControls {
+    pub size: u32,
+    pub classes: u32,
+}
+
+#[repr(C)]
+pub struct Notification {
+    pub window: Window,
+    pub id: usize,
+    pub code: i32,
+}
+
+#[repr(C)]
+pub struct Column {
+    pub mask: u32,
+    pub format: i32,
+    pub width: i32,
+    pub text: *mut u16,
+    pub text_capacity: i32,
+    pub subitem: i32,
+    pub image: i32,
+    pub order: i32,
+    pub minimum_width: i32,
+    pub default_width: i32,
+    pub ideal_width: i32,
+}
+
+#[repr(C)]
+pub struct Item {
+    pub mask: u32,
+    pub row: i32,
+    pub column: i32,
+    pub state: u32,
+    pub state_mask: u32,
+    pub text: *mut u16,
+    pub text_capacity: i32,
+    pub image: i32,
+    pub data: isize,
+    pub indent: i32,
+    pub group: i32,
+    pub columns: u32,
+    pub column_indices: *mut u32,
+    pub column_formats: *mut i32,
+    pub group_position: i32,
+}
+
+#[repr(C)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
 pub const LB_GETCURSEL: u32 = 0x0188;
 pub const LB_GETTEXT: u32 = 0x0189;
 pub const LB_GETTEXTLEN: u32 = 0x018A;
@@ -84,6 +161,8 @@ unsafe extern "system" {
     pub fn PostMessageW(window: Window, message: u32, wparam: usize, lparam: isize) -> i32;
     pub fn ShowWindow(window: Window, show: i32) -> i32;
     pub fn UpdateWindow(window: Window) -> i32;
+    pub fn GetClientRect(window: Window, rect: *mut Rect) -> i32;
+    pub fn SetFocus(window: Window) -> Window;
     pub fn MoveWindow(window: Window, x: i32, y: i32, width: i32, height: i32, repaint: i32) -> i32;
     pub fn SetWindowTextW(window: Window, text: *const u16) -> i32;
     pub fn GetWindowTextLengthW(window: Window) -> i32;
@@ -101,4 +180,15 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     pub fn GetModuleHandleW(module_name: *const u16) -> Instance;
+}
+
+
+#[link(name = "comctl32")]
+unsafe extern "system" {
+    pub fn InitCommonControlsEx(controls: *const InitControls) -> i32;
+}
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    pub fn GetStockObject(index: i32) -> Handle;
 }
