@@ -399,8 +399,9 @@ fn draw(
         };
         let chart_width = median_col.saturating_sub(chart_col + 3).min(32);
         if chart_width >= 2 {
+            let empty = history.is_empty();
             let graph = history.sparkline(chart_width);
-            let graph = if history.is_empty() { "▁" } else { graph };
+            let graph = if empty { "▁" } else { graph };
             buffer.push_str(&format!(
                 "\x1b[{chart_row};{chart_col}H{GREEN}{graph}{RESET}{BG}",
             ));
