@@ -763,6 +763,61 @@ mod tests {
     }
 
     #[test]
+    fn repetitive_typo_falls_back_safely() {
+        let dir = fixture();
+        fs::write(dir.join("folder").join("aaaaaab.log"), "test").unwrap();
+        let (catalog, _) = Catalog::open_or_build(&[dir.clone()], 1000, true).unwrap();
+        assert!(catalog.accelerated());
+        assert!(catalog.search("aaaaaac", 20)
+            .iter().any(|p| p.ends_with("aaaaaab.log")));
+        drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unicode_typo_is_not_lost_by_trigrams() {
+        let dir = fixture();
+        fs::write(dir.join("folder").join("Kittenzz.txt"), "test").unwrap();
+        let (catalog, _) = Catalog::open_or_build(&[dir.clone()], 1000, true).unwrap();
+        assert!(catalog.search("kittenxz", 20)
+            .iter().any(|p| p.ends_with("Kittenzz.txt")));
+        drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn index_copy_is_cancellable() {
+        let mut progress = IndexProgress::default();
+        let mut contents = Vec::new();
+        let mut source = std::io::Cursor::new(vec![42u8; 200_000]);
+        copy_with_cancel(&mut source, &mut contents, &progress).unwrap();
+        assert_eq!(contents.len(), 200_000);
+        progress.cancel();
+        let result = copy_with_cancel(&mut std::io::Cursor::new(b"new"), &mut Vec::new(), &progress);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn cancelling_lookup_preparation_keeps_catalog() {
+        let dir = fixture();
+        let roots = normalize_roots(&[dir.clone()]).unwrap();
+        let file = dir.join("lookup-cancel.idx");
+        Catalog::build_to_path(&roots, &file, 100, &IndexProgress::default()).unwrap();
+        let progress = IndexProgress::default();
+        progress.cancel();
+        let err = match Catalog::load_with_progress(&file, &roots_key(&roots), Some(&progress)) {
+            Ok(_) => panic!("lookup builder ignored cancellation"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        // The original filename snapshot remains readable after cancellation.
+        let catalog = Catalog::load(&file, &roots_key(&roots)).unwrap();
+        assert_eq!(catalog.search("minecraft", 10).len(), 1);
+        drop(catalog);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn invalid_limit() {
         let dir = fixture();
         assert!(Catalog::scan(&dir, 0).is_err());
