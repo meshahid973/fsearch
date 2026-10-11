@@ -177,13 +177,15 @@ fn start_scan(hwnd: Window, app: &mut App) {
     }
     status(app, &format!("Indexing {} ...", root.display()));
     let shared = Arc::clone(&app.result_slot);
+    // Native HWND pointers are not Send. Carry the opaque handle value only.
+    let window_id = hwnd as usize;
     std::thread::spawn(move || {
         let result = Catalog::scan(&root, DEFAULT_ENTRY_LIMIT).map_err(|e| e.to_string());
         if let Ok(mut slot) = shared.lock() {
             *slot = Some(result);
         }
         unsafe {
-            PostMessageW(hwnd, SCAN_READY, 0, 0);
+            PostMessageW(window_id as Window, SCAN_READY, 0, 0);
         }
     });
 }
