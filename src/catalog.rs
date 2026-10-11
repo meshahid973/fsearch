@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"FSWIN002";
+const MAGIC: &[u8; 8] = b"FSWIN003";
 const HEADER: usize = 32;
 pub const DEFAULT_ENTRY_LIMIT: usize = 50_000_000;
 const RESULT_LIMIT: usize = 5000;
@@ -59,6 +59,7 @@ pub struct Catalog {
     mapped: MappedFile,
     count: usize,
     offsets: usize,
+    masks: usize,
     paths: usize,
     summary: ScanSummary,
 }
@@ -118,8 +119,11 @@ impl Catalog {
         let skipped = word(b, 20).ok_or_else(|| invalid("invalid skipped count"))? as usize;
         let truncated = word(b, 24) == Some(1);
         let offsets = HEADER.checked_add(roots_len).ok_or_else(|| invalid("invalid root size"))?;
-        let paths = offsets
+        let masks = offsets
             .checked_add(count.checked_add(1).and_then(|n| n.checked_mul(4)).ok_or_else(|| invalid("invalid index size"))?)
+            .ok_or_else(|| invalid("invalid index size"))?;
+        let paths = masks
+            .checked_add(count.checked_mul(8).ok_or_else(|| invalid("invalid mask size"))?)
             .ok_or_else(|| invalid("invalid index size"))?;
         if paths > b.len() || b.get(HEADER..offsets) != Some(expected_roots.as_bytes()) {
             return Err(invalid("index belongs to another folder"));
@@ -140,7 +144,7 @@ impl Catalog {
             return Err(invalid("incomplete index"));
         }
         Ok(Self {
-            mapped, count, offsets, paths,
+            mapped, count, offsets, masks, paths,
             summary: ScanSummary { entries: count, directories, skipped, truncated },
         })
     }
@@ -153,12 +157,14 @@ impl Catalog {
         let pid = std::process::id();
         let spool_path = file.with_extension(format!("{pid}.paths"));
         let offsets_path = file.with_extension(format!("{pid}.offsets"));
+        let masks_path = file.with_extension(format!("{pid}.masks"));
         let next_path = file.with_extension(format!("{pid}.next"));
         let result = (|| -> io::Result<()> {
             let mut spool = BufWriter::new(File::create(&spool_path)?);
             // Stream offsets to disk rather than allocating 4 bytes for every
             // file (48 MB for a 12-million-entry catalog).
             let mut offsets = BufWriter::new(File::create(&offsets_path)?);
+            let mut masks = BufWriter::new(File::create(&masks_path)?);
             offsets.write_all(&0u32.to_le_bytes())?;
             let mut position = 0u32;
             let summary = walk::scan_with_progress(roots, limit, &progress.walk, |path| {
@@ -168,12 +174,16 @@ impl Catalog {
                 position = position.checked_add(length).ok_or_else(|| invalid("index too large"))?;
                 spool.write_all(bytes)?;
                 offsets.write_all(&position.to_le_bytes())?;
+                let name = display.rsplit(['\\', '/']).next().unwrap_or(&display);
+                masks.write_all(&filename_mask(name).to_le_bytes())?;
                 Ok(())
             })?;
             spool.flush()?;
             offsets.flush()?;
+            masks.flush()?;
             drop(spool);
             drop(offsets);
+            drop(masks);
             progress.phase.store(2, AtomicOrdering::Relaxed);
 
             let key = roots_key(roots);
@@ -189,6 +199,8 @@ impl Catalog {
             out.write_all(key.as_bytes())?;
             let mut offsets = File::open(&offsets_path)?;
             io::copy(&mut offsets, &mut out)?;
+            let mut masks = File::open(&masks_path)?;
+            io::copy(&mut masks, &mut out)?;
             let mut input = File::open(&spool_path)?;
             io::copy(&mut input, &mut out)?;
             out.flush()?;
@@ -201,6 +213,7 @@ impl Catalog {
         })();
         let _ = fs::remove_file(spool_path);
         let _ = fs::remove_file(offsets_path);
+        let _ = fs::remove_file(masks_path);
         let _ = fs::remove_file(next_path);
         result
     }
@@ -217,8 +230,16 @@ impl Catalog {
         }
         let limit = limit.min(RESULT_LIMIT);
         let needle = query.to_lowercase();
+        let required = filename_mask(&needle);
+        let allow_typo = needle.chars().count() >= 5;
+        let bytes = self.mapped.bytes();
         let mut best = BinaryHeap::with_capacity(limit + 1);
         for i in 0..self.count {
+            if required != 0 {
+                let Some(mask) = word64(bytes, self.masks + i * 8) else { continue };
+                let missing = (required & !mask).count_ones();
+                if missing > if allow_typo { 1 } else { 0 } { continue; }
+            }
             let Some(path) = self.path_at(i) else { continue };
             let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
             let Some(score) = rank(name, &needle) else { continue };
@@ -367,6 +388,26 @@ fn display_path(path: &Path) -> String {
     path.into_owned()
 }
 
+/// A necessary-letter filter. Non-ASCII names use all bits, guaranteeing
+/// that Unicode filenames aren't accidentally rejected.
+fn filename_mask(text: &str) -> u64 {
+    if !text.is_ascii() { return u64::MAX; }
+    text.bytes().fold(0u64, |mask, byte| {
+        let byte = byte.to_ascii_lowercase();
+        let bit = match byte {
+            b'a'..=b'z' => u32::from(byte - b'a'),
+            b'0'..=b'9' => 26 + u32::from(byte - b'0'),
+            b'.' => 36, b'-' => 37, b'_' => 38, b' ' => 39,
+            _ => 40,
+        };
+        mask | (1u64 << bit)
+    })
+}
+
+fn word64(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?))
+}
+
 fn word(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?))
 }
@@ -475,6 +516,16 @@ mod tests {
         assert!(rank("fsearch", "fsearch") > rank("fsearch.rs", "fsearch"));
         assert!(rank("fsearch.rs", "fsearch") > rank("my-fsearch.rs", "fsearch"));
         assert!(rank("fsearch.rs", "fsearch") > rank("fsearhc.rs", "fsearch"));
+    }
+
+    #[test]
+    fn name_filter_keeps_possible_matches() {
+        let exact = filename_mask("Minecraft Launcher.exe");
+        let query = filename_mask("minecraft");
+        assert_eq!((query & !exact).count_ones(), 0);
+        let typo = filename_mask("minecrafx");
+        assert!((query & !typo).count_ones() <= 1);
+        assert_eq!(filename_mask("日本語"), u64::MAX);
     }
 
     #[test]
