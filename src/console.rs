@@ -68,6 +68,7 @@ unsafe extern "system" {
     fn ReadConsoleInputW(handle: Handle, records: *mut InputRecord, size: u32, read: *mut u32) -> i32;
     fn GetConsoleScreenBufferInfo(handle: Handle, info: *mut BufferInfo) -> i32;
     fn SetConsoleOutputCP(codepage: u32) -> i32;
+    fn WaitForSingleObject(handle: Handle, timeout_ms: u32) -> u32;
 }
 
 pub fn open_window_with(roots: &[std::path::PathBuf], refresh: bool) -> io::Result<()> {
@@ -116,6 +117,17 @@ impl Terminal {
             }
             SetConsoleOutputCP(65001);
             Ok(Self { input, output, saved_input: in_mode, saved_output: out_mode })
+        }
+    }
+
+    /// Wait briefly for a key or a window-resize event without busy polling.
+    pub fn read_timeout(&self, timeout_ms: u32) -> io::Result<Option<InputRecord>> {
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT: u32 = 258;
+        match unsafe { WaitForSingleObject(self.input, timeout_ms) } {
+            WAIT_OBJECT_0 => self.read().map(Some),
+            WAIT_TIMEOUT => Ok(None),
+            _ => Err(io::Error::last_os_error()),
         }
     }
 
