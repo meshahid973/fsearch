@@ -60,7 +60,7 @@ fn list_directory(
     mut visit: impl FnMut(PathBuf, bool, bool) -> io::Result<bool>,
 ) -> io::Result<()> {
     use std::ffi::c_void;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
     #[repr(C)]
     #[derive(Default)]
