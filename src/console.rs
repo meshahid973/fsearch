@@ -179,14 +179,20 @@ mod tests {
     fn reads_key_from_new_console() {
         const CHILD_ENV: &str = "FSEARCH_CONSOLE_TEST_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
+            let log_path = std::env::temp_dir()
+                .join(format!("fsearch-console-test-{}.log", std::process::id()));
+            let log = File::create(&log_path).unwrap();
             let child = Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("console::tests::reads_key_from_new_console")
                 .env(CHILD_ENV, "1")
+                .stderr(log)
                 .creation_flags(CREATE_NEW_CONSOLE)
                 .status()
                 .unwrap();
-            assert!(child.success(), "new console failed to read injected key");
+            let error = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let _ = std::fs::remove_file(log_path);
+            assert!(child.success(), "console input test failed: {error}");
             return;
         }
 
