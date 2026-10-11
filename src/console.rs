@@ -1,6 +1,8 @@
 //! Windows console support for the interactive search interface.
 
 use std::io;
+use std::fs::File;
+use std::os::windows::io::AsRawHandle;
 use std::mem;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
@@ -44,6 +46,7 @@ struct BufferInfo {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetStdHandle(id: u32) -> Handle;
+    fn SetStdHandle(id: u32, handle: Handle) -> i32;
     fn GetConsoleMode(handle: Handle, mode: *mut u32) -> i32;
     fn SetConsoleMode(handle: Handle, mode: u32) -> i32;
     fn GetConsoleScreenBufferInfo(handle: Handle, info: *mut BufferInfo) -> i32;
@@ -69,30 +72,49 @@ pub fn open_window_with(roots: &[std::path::PathBuf], refresh: bool) -> io::Resu
 pub struct Terminal {
     output: Handle,
     saved_output: u32,
+    original_input: Handle,
+    _console_input: File,
 }
 
 // Console handles are used only by the thread that owns the TUI.
 impl Terminal {
     pub fn enter() -> io::Result<Self> {
+        // CREATE_NEW_CONSOLE can leave inherited standard handles pointing
+        // at the calling terminal. Always bind stdin to this window's input.
+        let console_input = File::open("CONIN$")?;
         unsafe {
-            let input = GetStdHandle(STD_INPUT_HANDLE);
-            let output = GetStdHandle(STD_OUTPUT_HANDLE);
-            let (mut in_mode, mut out_mode) = (0, 0);
-            if input.is_null() || output.is_null()
-                || GetConsoleMode(input, &mut in_mode) == 0
-                || GetConsoleMode(output, &mut out_mode) == 0
-            {
+            let original_input = GetStdHandle(STD_INPUT_HANDLE);
+            if SetStdHandle(STD_INPUT_HANDLE, console_input.as_raw_handle()) == 0 {
                 return Err(io::Error::last_os_error());
             }
-            // Use the terminal library to handle Windows Terminal/ConPTY keys.
-            enable_raw_mode()?;
-            if SetConsoleMode(output, out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
+            let output = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut input_mode = 0;
+            let mut output_mode = 0;
+            if output.is_null()
+                || GetConsoleMode(console_input.as_raw_handle(), &mut input_mode) == 0
+                || GetConsoleMode(output, &mut output_mode) == 0
+            {
+                let error = io::Error::last_os_error();
+                SetStdHandle(STD_INPUT_HANDLE, original_input);
+                return Err(error);
+            }
+            if let Err(error) = enable_raw_mode() {
+                SetStdHandle(STD_INPUT_HANDLE, original_input);
+                return Err(error);
+            }
+            if SetConsoleMode(output, output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
                 let error = io::Error::last_os_error();
                 let _ = disable_raw_mode();
+                SetStdHandle(STD_INPUT_HANDLE, original_input);
                 return Err(error);
             }
             SetConsoleOutputCP(65001);
-            Ok(Self { output, saved_output: out_mode })
+            Ok(Self {
+                output,
+                saved_output: output_mode,
+                original_input,
+                _console_input: console_input,
+            })
         }
     }
 
@@ -124,6 +146,7 @@ impl Drop for Terminal {
         unsafe {
             let _ = disable_raw_mode();
             SetConsoleMode(self.output, self.saved_output);
+            SetStdHandle(STD_INPUT_HANDLE, self.original_input);
         }
     }
 }
