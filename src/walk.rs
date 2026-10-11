@@ -77,7 +77,7 @@ pub fn scan_with_progress(
                         if work.closed {
                             break;
                         }
-                        work.pending.pop_front().unwrap()
+                        work.pending.pop_back().unwrap()
                     };
                     let mut entries = Vec::new();
                     let result = list_directory(&dir, |path, directory, reparse| {
@@ -267,9 +267,10 @@ pub fn local_drives() -> Vec<PathBuf> {
         }
         let letter = b'A' + index as u8;
         let root = [letter as u16, ':' as u16, '\\' as u16, 0];
-        // Include fixed and removable local drives, but not network shares.
+        // Only mounted fixed drives by default. Removable/network drives
+        // can be indexed explicitly with --root; unavailable drives can stall.
         let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
-        if kind == 2 || kind == 3 {
+        if kind == 3 {
             drives.push(PathBuf::from(format!("{}:\\", letter as char)));
         }
     }
@@ -279,4 +280,42 @@ pub fn local_drives() -> Vec<PathBuf> {
 #[cfg(not(windows))]
 pub fn local_drives() -> Vec<PathBuf> {
     vec![crate::default_root()]
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scans_nested_folders_and_multiple_roots() {
+        let folder = std::env::temp_dir().join(format!("fsearch-walk-{}", std::process::id()));
+        let first = folder.join("first");
+        let second = folder.join("second");
+        std::fs::create_dir_all(first.join("nested")).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("nested").join("first.txt"), "test").unwrap();
+        std::fs::write(second.join("second.txt"), "test").unwrap();
+        let mut found = Vec::new();
+        let progress = Progress::default();
+        let summary = scan_with_progress(&[first, second], 500, &progress, |path| {
+            found.push(path.to_owned());
+            Ok(())
+        }).unwrap();
+        assert_eq!(summary.entries, found.len());
+        assert!(found.iter().any(|p| p.ends_with("first.txt")));
+        assert!(found.iter().any(|p| p.ends_with("second.txt")));
+        assert!(!summary.truncated);
+        assert_eq!(summary.entries, progress.entries.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn scan_can_be_cancelled() {
+        let root = std::env::temp_dir();
+        let progress = Progress::default();
+        progress.cancelled.store(true, Ordering::Relaxed);
+        let result = scan_with_progress(&[root], 10, &progress, |_| Ok(()));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+    }
 }
