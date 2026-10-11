@@ -4,6 +4,7 @@
 //! memory-mapped indexing and filesystem change notifications come later.
 
 pub mod catalog;
+pub mod walk;
 pub use catalog::{Catalog, ScanSummary, DEFAULT_ENTRY_LIMIT, default_root};
 
 #[cfg(windows)]
