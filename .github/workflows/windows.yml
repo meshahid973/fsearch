@@ -18,3 +18,16 @@ jobs:
         run: cargo test --all-targets
       - name: Build
         run: cargo build --release
+      - name: Test command line
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "fsearch-smoke"
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          Set-Content -Path (Join-Path $root "fsearch-unique-alpha.txt") -Value "test"
+          $first = & .\target\release\fsearch.exe "fsearch-unique-alpha" --root $root --reindex 2>$null
+          if ($LASTEXITCODE -ne 0 -or $first.Count -ne 1) { throw "Initial search failed" }
+          Set-Content -Path (Join-Path $root "fsearch-unique-beta.txt") -Value "test"
+          $old = & .\target\release\fsearch.exe "fsearch-unique-beta" --root $root 2>$null
+          if ($LASTEXITCODE -ne 0 -or @($old).Count -ne 0) { throw "Saved index wasn't reused" }
+          $new = & .\target\release\fsearch.exe "fsearch-unique-beta" --root $root --reindex 2>$null
+          if ($LASTEXITCODE -ne 0 -or @($new).Count -ne 1) { throw "Refresh failed" }
