@@ -58,7 +58,12 @@ fn interactive_main(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
         return match tui::run(roots, refresh) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => fail(&error.to_string()),
+            Err(error) => {
+                eprintln!("fsearch: {error}");
+                eprintln!("Press Enter to close...");
+                let _ = std::io::stdin().read_line(&mut String::new());
+                ExitCode::FAILURE
+            }
         };
     }
 
