@@ -1,5 +1,6 @@
-//! Console entry point. The GUI lives in the separate fsearch-gui binary.
-use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, default_root};
+//! Command-line search against the saved index.
+
+use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, default_roots};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -14,16 +15,18 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let mut root = default_root();
+    let mut roots = Vec::<PathBuf>::new();
+    let mut refresh = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--root" => match args.next() {
-                Some(path) => root = PathBuf::from(path),
+                Some(path) => roots.push(PathBuf::from(path)),
                 None => {
                     eprintln!("fsearch: --root requires a directory");
                     return ExitCode::FAILURE;
                 }
             },
+            "--reindex" => refresh = true,
             other => {
                 eprintln!("fsearch: unexpected argument: {other}");
                 help();
@@ -31,25 +34,33 @@ fn main() -> ExitCode {
             }
         }
     }
+    if roots.is_empty() {
+        roots = default_roots();
+    }
 
-    let index = match Catalog::scan(&root, DEFAULT_ENTRY_LIMIT) {
-        Ok(index) => index,
+    let (catalog, cached) = match Catalog::open_or_build(&roots, DEFAULT_ENTRY_LIMIT, refresh) {
+        Ok(result) => result,
         Err(error) => {
-            eprintln!("fsearch: could not scan {}: {error}", root.display());
+            eprintln!("fsearch: {error}");
             return ExitCode::FAILURE;
         }
     };
-    for path in index.search(&query, 100) {
+    for path in catalog.search(&query, 100) {
         println!("{path}");
     }
-    let summary = index.summary();
-    eprintln!("Indexed {} entries ({} directories, {} skipped{})", summary.entries, summary.directories, summary.skipped, if summary.truncated { ", entry limit reached" } else { "" });
+    let s = catalog.summary();
+    eprintln!(
+        "{} {} entries ({} directories, {} skipped{})",
+        if cached { "Loaded" } else { "Indexed" },
+        s.entries, s.directories, s.skipped,
+        if s.truncated { ", limit reached" } else { "" }
+    );
     ExitCode::SUCCESS
 }
 
 fn help() {
-    println!("FSearch - Windows filename search (phase 1)");
-    println!("Usage: fsearch <filename> [--root DIRECTORY]");
-    println!("The first version scans the selected tree for each CLI invocation.");
-    println!("Run fsearch-gui.exe for a native desktop interface.");
+    println!("FSearch - fast Windows filename search");
+    println!("Usage: fsearch <query> [--root DIRECTORY]... [--reindex]");
+    println!("Without --root, searches local drives. Use --reindex to refresh saved results.");
+    println!("Run fsearch-gui.exe to open the desktop app.");
 }
