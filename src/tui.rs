@@ -29,56 +29,133 @@ pub fn run(roots: Vec<PathBuf>, force_refresh: bool) -> io::Result<()> {
     result
 }
 
+struct SearchResult {
+    generation: u64,
+    paths: Vec<String>,
+    elapsed: Duration,
+}
+
+struct SearchWorker {
+    queries: mpsc::Sender<(u64, String, usize)>,
+    results: mpsc::Receiver<SearchResult>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+fn start_search_worker(catalog: Catalog) -> SearchWorker {
+    let (queries, rx) = mpsc::channel::<(u64, String, usize)>();
+    let (tx, results) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        while let Ok(mut request) = rx.recv() {
+            // Only the newest queued query matters while someone is typing.
+            while let Ok(next) = rx.try_recv() {
+                request = next;
+            }
+            let started = Instant::now();
+            let paths = catalog.search(&request.1, request.2)
+                .into_iter().map(str::to_owned).collect();
+            if tx.send(SearchResult {
+                generation: request.0,
+                paths,
+                elapsed: started.elapsed(),
+            }).is_err() {
+                break;
+            }
+        }
+    });
+    SearchWorker { queries, results, handle }
+}
+
+impl SearchWorker {
+    fn stop(self) {
+        drop(self.queries);
+        let _ = self.handle.join();
+    }
+}
+
 fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_refresh: bool) -> io::Result<()> {
     let mut query = String::new();
-    let Some((mut catalog, mut cached)) = load_index(term, out, &roots, force_refresh, &mut query)? else {
+    let Some((catalog, mut cached)) = load_index(term, out, &roots, force_refresh, &mut query)? else {
         return Ok(());
     };
+    let mut summary = catalog.summary();
+    let mut worker = start_search_worker(catalog);
     let mut selected = 0usize;
-    let mut pending_high_surrogate: Option<u16> = None;
+    let mut pending_high_surrogate = None;
+    let mut elapsed = Duration::ZERO;
+    let mut hits: Vec<String> = Vec::new();
+    let mut generation = 0u64;
+    let mut pending = false;
+    let mut redraw = true;
 
-    loop {
-        let started = Instant::now();
+    if !query.is_empty() {
+        generation += 1;
         let (_, height) = term.dimensions();
-        let limit = height.saturating_sub(10).clamp(3, 50);
-        let hits = catalog.search(&query, limit);
-        selected = selected.min(hits.len().saturating_sub(1));
-        let elapsed = started.elapsed();
-        draw(term, out, &query, &hits, selected, elapsed, catalog.summary(), cached, &roots)?;
+        worker.queries.send((generation, query.clone(), height.saturating_sub(10).clamp(3, 50)))
+            .map_err(|_| io::Error::other("search worker stopped"))?;
+        pending = true;
+    }
+    loop {
+        while let Ok(found) = worker.results.try_recv() {
+            if found.generation != generation { continue; }
+            elapsed = found.elapsed;
+            hits = found.paths;
+            selected = selected.min(hits.len().saturating_sub(1));
+            pending = false;
+            redraw = true;
+        }
+        if redraw {
+            draw(term, out, &query, &hits, selected, elapsed, summary, cached, &roots, pending)?;
+            redraw = false;
+        }
 
-        let event = term.read()?;
+        let Some(event) = term.read_timeout(65)? else { continue };
         if event.event_type == RESIZE_EVENT {
+            redraw = true;
             continue;
         }
         if event.event_type != KEY_EVENT || event.key.pressed == 0 {
             continue;
         }
+        let mut changed = false;
         match event.key.virtual_key {
-            0x1B => return Ok(()), // Esc
-            0x08 => { query.pop(); selected = 0; }, // Backspace
-            0x26 => selected = selected.saturating_sub(1), // Up
-            0x28 => selected = (selected + 1).min(hits.len().saturating_sub(1)), // Down
+            0x1B => {
+                worker.stop();
+                return Ok(());
+            }
+            0x08 => {
+                if query.pop().is_some() { changed = true; }
+            }
+            0x26 => {
+                selected = selected.saturating_sub(1);
+                redraw = true;
+            }
+            0x28 => {
+                selected = (selected + 1).min(hits.len().saturating_sub(1));
+                redraw = true;
+            }
             0x0D => {
-                if let Some(path) = hits.get(selected) {
-                    let _ = reveal(path);
+                if !pending {
+                    if let Some(path) = hits.get(selected) {
+                        let _ = reveal(path);
+                    }
                 }
             }
             0x52 if event.key.modifiers & 0x000c != 0 => {
-                // Release the mapped file before replacing the index on disk.
-                drop(hits);
-                drop(catalog);
+                worker.stop(); // release the old file mapping before replacement
                 let Some((updated, from_disk)) = load_index(term, out, &roots, true, &mut query)? else {
                     return Ok(());
                 };
-                catalog = updated;
+                summary = updated.summary();
                 cached = from_disk;
+                worker = start_search_worker(updated);
+                hits.clear();
+                pending = false;
                 selected = 0;
+                changed = true;
             }
             _ => {
                 let unit = event.key.character;
-                if unit == 0 || unit < 0x20 {
-                    continue;
-                }
+                if unit == 0 || unit < 0x20 { continue; }
                 if (0xD800..=0xDBFF).contains(&unit) {
                     pending_high_surrogate = Some(unit);
                     continue;
@@ -91,10 +168,25 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
                 if let Some(character) = character {
                     if query.chars().count() < 160 {
                         query.push(character);
-                        selected = 0;
+                        changed = true;
                     }
                 }
             }
+        }
+        if changed {
+            generation += 1;
+            selected = 0;
+            hits.clear();
+            if query.is_empty() {
+                pending = false;
+                elapsed = Duration::ZERO;
+            } else {
+                let (_, height) = term.dimensions();
+                worker.queries.send((generation, query.clone(), height.saturating_sub(10).clamp(3, 50)))
+                    .map_err(|_| io::Error::other("search worker stopped"))?;
+                pending = true;
+            }
+            redraw = true;
         }
     }
 }
@@ -188,12 +280,13 @@ fn draw(
     term: &Terminal,
     out: &mut impl Write,
     query: &str,
-    hits: &[&str],
+    hits: &[String],
     selected: usize,
     duration: Duration,
     info: ScanSummary,
     cached: bool,
     roots: &[PathBuf],
+    pending: bool,
 ) -> io::Result<()> {
     let (width, height) = term.dimensions();
     let width = width.min(240);
@@ -219,7 +312,7 @@ fn draw(
     let max = height.saturating_sub(10);
     for (i, path) in hits.iter().take(max).enumerate() {
         let idx = path.rfind(['\\', '/']);
-        let name = idx.map_or(*path, |n| &path[n + 1..]);
+        let name = idx.map_or(path.as_str(), |n| &path[n + 1..]);
         let location = idx.map_or("", |n| &path[..n]);
         let file = shorten(name, (width / 3).max(16));
         let folder = shorten(location, width.saturating_sub(file.chars().count() + margin.len() + 6));
@@ -228,7 +321,11 @@ fn draw(
     }
     let partial = if info.truncated { "  ·  index incomplete (limit reached)" } else { "" };
     let origin = if cached { "saved index" } else { "new index" };
-    let status = format!("{origin} · {count} entries · {} skipped{partial}", info.skipped);
+    let status = if pending {
+        format!("searching...  ·  {origin} · {count} entries · {} skipped{partial}", info.skipped)
+    } else {
+        format!("{origin} · {count} entries · {} skipped{partial}", info.skipped)
+    };
     let foot = "↑↓ select   Enter reveal   Ctrl+R reindex   Esc quit";
     buffer.push_str(&format!("\x1b[{};1H{margin}{GREY}{}{RESET}{BG}", height.saturating_sub(2), shorten(&status, width.saturating_sub(margin.len() + 1))));
     buffer.push_str(&format!("\x1b[{};1H{margin}{GREY}{}{RESET}{BG}", height.saturating_sub(1), shorten(foot, width.saturating_sub(margin.len() + 1))));
