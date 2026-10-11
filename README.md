@@ -1,8 +1,6 @@
 # FSearch
 
-Fast file search for Windows, written in Rust. FSearch has a native desktop app and a command-line tool.
-
-FSearch saves its filename index in `%LOCALAPPDATA%\FSearch` and reuses it the next time you open the app. It searches local drives by default, or any folders you specify. Files in unreadable folders are skipped.
+Fast, lightweight file search for Windows. FSearch indexes filenames on local drives and lets you search them in a terminal window. Written in Rust.
 
 ## Build
 
@@ -14,21 +12,26 @@ cargo build --release
 
 ## Run
 
-Desktop app:
-
 ```powershell
-.\target\release\fsearch-gui.exe
+.\target\release\fsearch.exe
 ```
 
-Command line:
+This opens a new terminal window. Type to search, use the arrow keys to select a result, press Enter to reveal it in Explorer, Ctrl+R to rebuild the index, or Esc to quit.
+
+To use the current terminal instead:
+
+```powershell
+.\target\release\fsearch.exe --interactive
+```
+
+To print search results without opening an interactive window:
 
 ```powershell
 .\target\release\fsearch.exe "minecraft"
 .\target\release\fsearch.exe "readme" --root "D:\"
-.\target\release\fsearch.exe "notes" --root "C:\Users" --root "D:\Projects"
 ```
 
-Click **Refresh** in the app, or add `--reindex` to a terminal search, to update the saved index. Automatic filesystem monitoring and searching inside file contents are not supported yet.
+The index is saved in `%LOCALAPPDATA%\FSearch`. New and deleted files are picked up when you reindex; automatic live monitoring is not available yet.
 
 ## License
 
