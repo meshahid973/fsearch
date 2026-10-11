@@ -63,9 +63,14 @@ fn interact(term: &Terminal, out: &mut impl Write, roots: Vec<PathBuf>, force_re
             }
             0x52 if event.key.modifiers & 0x000c != 0 => {
                 show_message(term, out, "Refreshing file index...")?;
+                // Windows cannot always replace an open memory-mapped file.
+                // Release all result references and the old map first.
+                drop(hits);
+                drop(catalog);
                 let (updated, from_disk) = Catalog::open_or_build(&roots, DEFAULT_ENTRY_LIMIT, true)?;
                 catalog = updated;
                 cached = from_disk;
+                selected = 0;
             }
             _ => {
                 let unit = event.key.character;
