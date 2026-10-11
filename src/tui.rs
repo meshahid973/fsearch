@@ -328,7 +328,8 @@ fn draw(
     // Reserve two bottom rows for the green latency sparkline. A small
     // terminal omits it rather than letting the chart overlap search results.
     if height >= 16 {
-        let graph_width = width.saturating_sub(margin.len() + 3).min(64);
+        // Leave space for the peak label to avoid wrapping on narrow windows.
+        let graph_width = width.saturating_sub(margin.len() + 27).min(56);
         if let Some(stats) = history.stats() {
             let title = format!(
                 "Latency  ·  {} searches  ·  avg {:.2} ms  ·  p95 {:.2} ms",
