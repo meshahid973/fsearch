@@ -7,12 +7,13 @@ use crate::{mapped::MappedFile, walk};
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"FSWIN002";
 const HEADER: usize = 32;
-pub const DEFAULT_ENTRY_LIMIT: usize = 12_000_000;
+pub const DEFAULT_ENTRY_LIMIT: usize = 50_000_000;
 const RESULT_LIMIT: usize = 5000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -21,6 +22,33 @@ pub struct ScanSummary {
     pub directories: usize,
     pub skipped: usize,
     pub truncated: bool,
+}
+
+/// Live counters during an initial whole-drive scan.
+#[derive(Default)]
+pub struct IndexProgress {
+    walk: walk::Progress,
+    phase: AtomicU8,
+}
+
+impl IndexProgress {
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            entries: self.walk.entries.load(AtomicOrdering::Relaxed),
+            directories: self.walk.directories.load(AtomicOrdering::Relaxed),
+            skipped: self.walk.skipped.load(AtomicOrdering::Relaxed),
+            phase: self.phase.load(AtomicOrdering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ProgressSnapshot {
+    pub entries: usize,
+    pub directories: usize,
+    pub skipped: usize,
+    /// 0: opening, 1: scanning, 2: saving, 3: loading, 4: complete
+    pub phase: u8,
 }
 
 pub struct Catalog {
@@ -38,18 +66,35 @@ impl Catalog {
         if limit == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "entry limit must be positive"));
         }
+        Self::open_or_build_with_progress(roots, limit, refresh, &IndexProgress::default())
+    }
+
+    pub fn open_or_build_with_progress(
+        roots: &[PathBuf],
+        limit: usize,
+        refresh: bool,
+        progress: &IndexProgress,
+    ) -> io::Result<(Self, bool)> {
+        if limit == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "entry limit must be positive"));
+        }
         let roots = normalize_roots(roots)?;
         let key = roots_key(&roots);
         let file = index_path(&key);
         if !refresh {
             if let Ok(index) = Self::load(&file, &key) {
                 if index.summary.entries <= limit && !(index.summary.truncated && index.summary.entries < limit) {
+                    progress.phase.store(4, AtomicOrdering::Relaxed);
                     return Ok((index, true));
                 }
             }
         }
-        Self::build_to_path(&roots, &file, limit)?;
-        Self::load(&file, &key).map(|index| (index, false))
+        progress.phase.store(1, AtomicOrdering::Relaxed);
+        Self::build_to_path(&roots, &file, limit, progress)?;
+        progress.phase.store(3, AtomicOrdering::Relaxed);
+        let index = Self::load(&file, &key)?;
+        progress.phase.store(4, AtomicOrdering::Relaxed);
+        Ok((index, false))
     }
 
     /// Build a snapshot for a single folder.
@@ -96,29 +141,36 @@ impl Catalog {
         })
     }
 
-    fn build_to_path(roots: &[PathBuf], file: &Path, limit: usize) -> io::Result<()> {
+    fn build_to_path(roots: &[PathBuf], file: &Path, limit: usize, progress: &IndexProgress) -> io::Result<()> {
         if limit == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "entry limit must be positive"));
         }
         fs::create_dir_all(file.parent().ok_or_else(|| invalid("missing index directory"))?)?;
         let pid = std::process::id();
         let spool_path = file.with_extension(format!("{pid}.paths"));
+        let offsets_path = file.with_extension(format!("{pid}.offsets"));
         let next_path = file.with_extension(format!("{pid}.next"));
         let result = (|| -> io::Result<()> {
             let mut spool = BufWriter::new(File::create(&spool_path)?);
-            let mut offsets = vec![0u32];
+            // Stream offsets to disk rather than allocating 4 bytes for every
+            // file (48 MB for a 12-million-entry catalog).
+            let mut offsets = BufWriter::new(File::create(&offsets_path)?);
+            offsets.write_all(&0u32.to_le_bytes())?;
             let mut position = 0u32;
-            let summary = walk::scan(roots, limit, |path| {
+            let summary = walk::scan_with_progress(roots, limit, &progress.walk, |path| {
                 let display = display_path(path);
                 let bytes = display.as_bytes();
                 let length = u32::try_from(bytes.len()).map_err(|_| invalid("path too long"))?;
                 position = position.checked_add(length).ok_or_else(|| invalid("index too large"))?;
                 spool.write_all(bytes)?;
-                offsets.push(position);
+                offsets.write_all(&position.to_le_bytes())?;
                 Ok(())
             })?;
             spool.flush()?;
+            offsets.flush()?;
             drop(spool);
+            drop(offsets);
+            progress.phase.store(2, AtomicOrdering::Relaxed);
 
             let key = roots_key(roots);
             let keylen = u32::try_from(key.len()).map_err(|_| invalid("root list too long"))?;
@@ -131,9 +183,8 @@ impl Catalog {
             out.write_all(&(summary.truncated as u32).to_le_bytes())?;
             out.write_all(&0u32.to_le_bytes())?;
             out.write_all(key.as_bytes())?;
-            for offset in offsets {
-                out.write_all(&offset.to_le_bytes())?;
-            }
+            let mut offsets = File::open(&offsets_path)?;
+            io::copy(&mut offsets, &mut out)?;
             let mut input = File::open(&spool_path)?;
             io::copy(&mut input, &mut out)?;
             out.flush()?;
@@ -145,6 +196,7 @@ impl Catalog {
             Ok(())
         })();
         let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(offsets_path);
         let _ = fs::remove_file(next_path);
         result
     }
@@ -354,7 +406,7 @@ mod tests {
         let dir = fixture();
         let file = dir.join("index.dat");
         let roots = normalize_roots(&[dir.clone()]).unwrap();
-        Catalog::build_to_path(&roots, &file, 100).unwrap();
+        Catalog::build_to_path(&roots, &file, 100, &IndexProgress::default()).unwrap();
         let catalog = Catalog::load(&file, &roots_key(&roots)).unwrap();
         assert_eq!(catalog.search("minecraft", 10).len(), 1);
         assert_eq!(catalog.search("日本語", 10).len(), 1);
@@ -377,7 +429,7 @@ mod tests {
         let dir = fixture();
         let roots = normalize_roots(&[dir.clone()]).unwrap();
         let file = dir.join("bound.dat");
-        Catalog::build_to_path(&roots, &file, 1).unwrap();
+        Catalog::build_to_path(&roots, &file, 1, &IndexProgress::default()).unwrap();
         let catalog = Catalog::load(&file, &roots_key(&roots)).unwrap();
         assert_eq!(catalog.summary().entries, 1);
         assert!(catalog.summary().truncated);
