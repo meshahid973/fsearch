@@ -108,6 +108,7 @@ impl Catalog {
         Self::open_or_build(&[root.to_path_buf()], limit, true).map(|(index, _)| index)
     }
 
+    #[cfg(test)]
     fn load(file: &Path, expected_roots: &str) -> io::Result<Self> {
         Self::load_with_progress(file, expected_roots, None)
     }
