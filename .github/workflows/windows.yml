@@ -3,6 +3,8 @@ name: Windows build
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -18,6 +20,8 @@ jobs:
         run: cargo test --all-targets
       - name: Build
         run: cargo build --release
+      - name: Search benchmark
+        run: cargo test --release --lib benchmark_search -- --ignored --nocapture
       - name: Test command line
         shell: pwsh
         run: |
