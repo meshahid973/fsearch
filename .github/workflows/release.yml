@@ -1,0 +1,136 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build Windows executables
+        run: cargo build --release --locked
+
+      - name: Package portable version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = 'dist\FSearch-Windows-x64'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item 'target\release\fsearch.exe' $stage
+          Copy-Item 'target\release\fsearch-launcher.exe' $stage
+          Copy-Item 'LICENSE' $stage
+          @'
+          FSearch for Windows
+
+          Double-click fsearch-launcher.exe to open FSearch.
+          Keep fsearch.exe in the same folder: it runs the search engine.
+
+          Keys: type to search, arrows to select, Enter to reveal,
+          Ctrl+R to refresh the index, Esc to quit.
+
+          Filename-only search. No admin or Rust installation required.
+          '@ | Set-Content -Path "$stage\README.txt" -Encoding utf8
+          Compress-Archive -Path "$stage\*" -DestinationPath 'dist\FSearch-Windows-x64.zip' -CompressionLevel Optimal
+          if (-not (Test-Path 'dist\FSearch-Windows-x64.zip')) { throw 'Portable ZIP was not created' }
+
+      - name: Find Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $compiler)) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          }
+          if (-not (Test-Path $compiler)) { throw 'ISCC.exe was not found' }
+          "ISCC_PATH=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & $env:ISCC_PATH 'installer\fsearch.iss'
+          if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
+          if (-not (Test-Path 'dist\FSearch-Setup-0.2.0.exe')) { throw 'Setup executable is missing' }
+
+      - name: Test installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'FSearch-Install-Test'
+          $setup = (Resolve-Path 'dist\FSearch-Setup-0.2.0.exe').Path
+          $args = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/DIR="' + $dir + '"'))
+          $process = Start-Process -FilePath $setup -ArgumentList $args -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer failed ($($process.ExitCode))" }
+          foreach ($name in @('fsearch.exe', 'fsearch-launcher.exe', 'unins000.exe')) {
+            if (-not (Test-Path (Join-Path $dir $name))) { throw "Installed file missing: $name" }
+          }
+          & (Join-Path $dir 'fsearch.exe') --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Installed CLI failed' }
+          $remove = Start-Process -FilePath (Join-Path $dir 'unins000.exe') -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($remove.ExitCode -ne 0) { throw "Uninstall failed ($($remove.ExitCode))" }
+          if (Test-Path (Join-Path $dir 'fsearch.exe')) { throw 'Uninstaller left the executable behind' }
+
+      - name: Write checksums
+        shell: pwsh
+        run: |
+          $files = @('dist\FSearch-Setup-0.2.0.exe', 'dist\FSearch-Windows-x64.zip')
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path $file -Leaf)"
+          }
+          [System.IO.File]::WriteAllLines(
+            (Join-Path (Get-Location) 'dist\SHA256SUMS.txt'),
+            $lines,
+            [System.Text.Encoding]::ASCII
+          )
+
+      - name: Upload Windows downloads
+        uses: actions/upload-artifact@v4
+        with:
+          name: FSearch-Windows-v0.2.0
+          path: |
+            dist/FSearch-Setup-0.2.0.exe
+            dist/FSearch-Windows-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.2.0
+          name: FSearch v0.2.0 (Windows)
+          make_latest: true
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            FSearch for Windows 10/11 (x64).
+
+            - FSearch-Setup-0.2.0.exe: installer with a Start Menu shortcut and uninstaller.
+            - FSearch-Windows-x64.zip: portable version. Extract and open fsearch-launcher.exe.
+            - SHA256SUMS.txt: download checksums.
+
+            Standalone Rust search engine; no Rust installation or administrator rights required.
+            Searches filenames, not file contents. Refresh with Ctrl+R to update indexed files.
+
+            The binaries are currently unsigned. Windows SmartScreen may show an unrecognized publisher warning.
+          files: |
+            dist/FSearch-Setup-0.2.0.exe
+            dist/FSearch-Windows-x64.zip
+            dist/SHA256SUMS.txt
