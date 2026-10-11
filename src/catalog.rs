@@ -376,6 +376,11 @@ fn rank(name: &str, query: &str) -> Option<i32> {
     }
     if !name.is_ascii() || !query.is_ascii() {
         let lower = name.to_lowercase();
+        // A Unicode filename may lowercase into an entirely ASCII name
+        // (e.g. the Kelvin sign K → k). Preserve typo matching after folding.
+        if lower.is_ascii() && query.is_ascii() {
+            return rank_ascii(lower.as_bytes(), query.as_bytes());
+        }
         return rank_unicode(&lower, query);
     }
     rank_ascii(name.as_bytes(), query.as_bytes())
