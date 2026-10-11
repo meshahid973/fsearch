@@ -8,6 +8,8 @@ use std::process::ExitCode;
 mod console;
 #[cfg(windows)]
 mod tui;
+#[cfg(windows)]
+mod latency;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
