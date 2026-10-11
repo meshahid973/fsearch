@@ -321,9 +321,16 @@ fn draw(
         } else {
             roots.first().map(|p| p.display().to_string()).unwrap_or_default()
         };
+        let header_info = if width >= 68 {
+            format!("    {}  ·  {count} files and folders", shorten(&header, width - 44))
+        } else if width >= 40 {
+            format!("    {count} entries")
+        } else {
+            String::new()
+        };
         buffer.push_str(&format!(
-            "\x1b[3;{}H{BOLD}FSearch{RESET}{BG}    {GREY}{}  ·  {} files and folders{RESET}{BG}",
-            margin.len() + 1, shorten(&header, width.saturating_sub(44)), count,
+            "\x1b[3;{}H{BOLD}FSearch{RESET}{BG}{GREY}{}{RESET}{BG}",
+            margin.len() + 1, header_info,
         ));
     } else {
         buffer.push_str(&format!("\x1b[5;1H{BG}\x1b[0J"));
