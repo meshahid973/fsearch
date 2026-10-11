@@ -3,7 +3,7 @@
 //! Each key updates the results from the saved index. The input reader
 //! blocks while idle: there is no polling or background render loop.
 
-use crate::{Catalog, DEFAULT_ENTRY_LIMIT, default_roots};
+use fsearch::{Catalog, DEFAULT_ENTRY_LIMIT, ScanSummary};
 use crate::console::Terminal;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -99,7 +99,7 @@ fn draw(
     hits: &[&str],
     selected: usize,
     duration: Duration,
-    info: crate::ScanSummary,
+    info: ScanSummary,
     cached: bool,
     roots: &[PathBuf],
 ) -> io::Result<()> {

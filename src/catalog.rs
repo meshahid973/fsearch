@@ -7,7 +7,7 @@ use crate::{mapped::MappedFile, walk};
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"FSWIN002";
