@@ -280,7 +280,11 @@ fn reveal_selected(app: &App) {
         return;
     }
     let Some(path) = app.matches.get(index as usize) else { return };
-    if let Err(error) = std::process::Command::new("explorer.exe")
+    let Some(windows_dir) = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")) else {
+        status(app, "Windows directory is unavailable");
+        return;
+    };
+    if let Err(error) = std::process::Command::new(PathBuf::from(windows_dir).join("explorer.exe"))
         .arg("/select,").arg(path).spawn()
     {
         status(app, &format!("Explorer error: {error}"));

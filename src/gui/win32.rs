@@ -1,6 +1,6 @@
 //! Minimal Win32 declarations used by the GUI.
 //! Keeping these here avoids an additional crate and any runtime framework.
-#![allow(non_snake_case, non_camel_case_types, dead_code)]
+#![allow(non_snake_case)]
 
 use std::ffi::c_void;
 
@@ -43,11 +43,7 @@ pub const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub const WS_CHILD: u32 = 0x4000_0000;
 pub const WS_BORDER: u32 = 0x0080_0000;
-pub const WS_VSCROLL: u32 = 0x0020_0000;
 pub const ES_AUTOHSCROLL: u32 = 0x0080;
-pub const LBS_NOTIFY: u32 = 0x0001;
-pub const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
-pub const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
 pub const COLOR_WINDOW: isize = 5;
 pub const CW_USEDEFAULT: i32 = i32::MIN;
 pub const SW_SHOW: i32 = 5;
@@ -61,7 +57,6 @@ pub const WM_APP: u32 = 0x8000;
 pub const GWLP_USERDATA: i32 = -21;
 pub const EN_CHANGE: usize = 0x0300;
 pub const BN_CLICKED: usize = 0;
-pub const LBN_DBLCLK: usize = 2;
 pub const WM_NOTIFY: u32 = 0x004e;
 pub const WM_SETFONT: u32 = 0x0030;
 pub const NM_DBLCLK: i32 = -3;
@@ -139,11 +134,6 @@ pub struct Rect {
     pub right: i32,
     pub bottom: i32,
 }
-pub const LB_GETCURSEL: u32 = 0x0188;
-pub const LB_GETTEXT: u32 = 0x0189;
-pub const LB_GETTEXTLEN: u32 = 0x018A;
-pub const LB_ADDSTRING: u32 = 0x0180;
-pub const LB_RESETCONTENT: u32 = 0x0184;
 
 #[link(name = "user32")]
 unsafe extern "system" {
