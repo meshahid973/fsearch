@@ -153,7 +153,7 @@ impl Lookup {
             .filter_map(|gram_bytes| self.postings_for(gram(gram_bytes)).map(|(_, n)| n))
             .min()
             .unwrap_or(0);
-        smallest <= self.count.saturating_div(20).max(128)
+        smallest <= self.count.saturating_div(32).max(96)
     }
 
     /// Sorted filename references allow binary-prefix lookup without touching
