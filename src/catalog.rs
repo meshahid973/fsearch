@@ -91,13 +91,13 @@ impl Catalog {
         let roots = normalize_roots(roots)?;
         let key = roots_key(&roots);
         let file = index_path(&key);
-        if !refresh {
-            if let Ok(index) = Self::load_with_progress(&file, &key, Some(progress)) {
-                if index.summary.entries <= limit && !(index.summary.truncated && index.summary.entries < limit) {
-                    progress.phase.store(4, AtomicOrdering::Relaxed);
-                    return Ok((index, true));
-                }
-            }
+        if !refresh
+            && let Ok(index) = Self::load_with_progress(&file, &key, Some(progress))
+            && index.summary.entries <= limit
+            && !(index.summary.truncated && index.summary.entries < limit)
+        {
+            progress.phase.store(4, AtomicOrdering::Relaxed);
+            return Ok((index, true));
         }
         progress.phase.store(1, AtomicOrdering::Relaxed);
         Self::build_to_path(&roots, &file, limit, progress)?;
@@ -271,34 +271,29 @@ impl Catalog {
         let mut best = BinaryHeap::with_capacity(limit + 1);
         let mut used_index = false;
 
-        if let Some(lookup) = &self.lookup {
-            if needle.is_ascii() && needle.len() >= 3 && lookup.selective(&needle) {
-                if let Some(ids) = lookup.substring_candidates(&needle) {
-                    used_index = true;
-                    // Substring postings already include every ASCII prefix
-                    // candidate. A separate sorted-prefix pass duplicated
-                    // work and allocated an unnecessary vector for common
-                    // queries.
-                    for (n, id) in ids.into_iter().enumerate() {
-                        if n % 1024 == 0 && cancelled() { return Vec::new(); }
-                        self.offer(id as usize, &needle, limit, false, &mut best);
-                    }
-                }
+        if let Some(lookup) = &self.lookup
+            && needle.is_ascii() && needle.len() >= 3
+            && lookup.selective(&needle)
+            && let Some(ids) = lookup.substring_candidates(&needle)
+        {
+            used_index = true;
+            for (n, id) in ids.into_iter().enumerate() {
+                if n % 1024 == 0 && cancelled() { return Vec::new(); }
+                self.offer(id as usize, &needle, limit, false, &mut best);
             }
         }
 
         // When there are no substring hits, use overlapping trigrams to
         // narrow one-edit typo candidates on sufficiently long queries.
         let mut fuzzy_indexed = false;
-        if used_index && best.is_empty() && needle.chars().count() >= 7 {
-            if let Some(ids) = self.lookup.as_ref()
+        if used_index && best.is_empty() && needle.chars().count() >= 7
+            && let Some(ids) = self.lookup.as_ref()
                 .and_then(|lookup| lookup.fuzzy_candidates(&needle))
-            {
-                fuzzy_indexed = true;
-                for (n, id) in ids.into_iter().enumerate() {
-                    if n % 1024 == 0 && cancelled() { return Vec::new(); }
-                    self.offer(id as usize, &needle, limit, true, &mut best);
-                }
+        {
+            fuzzy_indexed = true;
+            for (n, id) in ids.into_iter().enumerate() {
+                if n % 1024 == 0 && cancelled() { return Vec::new(); }
+                self.offer(id as usize, &needle, limit, true, &mut best);
             }
         }
 
@@ -391,10 +386,11 @@ fn rank_ascii(name: &[u8], query: &[u8]) -> Option<i32> {
     if name.eq_ignore_ascii_case(query) {
         return Some(4000);
     }
-    if query.len() <= name.len() {
-        if let Some(index) = name.windows(query.len()).position(|part| part.eq_ignore_ascii_case(query)) {
-            return Some(if index == 0 { 3000 } else { 2000 } - length - index as i32);
-        }
+    if query.len() <= name.len()
+        && let Some(index) = name.windows(query.len())
+            .position(|part| part.eq_ignore_ascii_case(query))
+    {
+        return Some(if index == 0 { 3000 } else { 2000 } - length - index as i32);
     }
     if query.len() < 5 || query.len() > name.len() {
         return None;
@@ -557,7 +553,7 @@ mod tests {
     fn persistent_index_and_unicode() {
         let dir = fixture();
         let file = dir.join("index.dat");
-        let roots = normalize_roots(&[dir.clone()]).unwrap();
+        let roots = normalize_roots(std::slice::from_ref(&dir)).unwrap();
         Catalog::build_to_path(&roots, &file, 100, &IndexProgress::default()).unwrap();
         let catalog = Catalog::load(&file, &roots_key(&roots)).unwrap();
         assert_eq!(catalog.search("minecraft", 10).len(), 1);
@@ -579,7 +575,7 @@ mod tests {
     #[test]
     fn bounded_scan() {
         let dir = fixture();
-        let roots = normalize_roots(&[dir.clone()]).unwrap();
+        let roots = normalize_roots(std::slice::from_ref(&dir)).unwrap();
         let file = dir.join("bound.dat");
         Catalog::build_to_path(&roots, &file, 1, &IndexProgress::default()).unwrap();
         let catalog = Catalog::load(&file, &roots_key(&roots)).unwrap();
@@ -718,7 +714,7 @@ mod tests {
         ] {
             fs::write(dir.join(where_).join(name), "test").unwrap();
         }
-        let (catalog, _) = Catalog::open_or_build(&[dir.clone()], 200, true).unwrap();
+        let (catalog, _) = Catalog::open_or_build(std::slice::from_ref(&dir), 200, true).unwrap();
         assert!(catalog.lookup.is_some(), "lookup must build for the fixture");
         let cat = catalog.search("cat", 50);
         assert_eq!(cat.len(), 6);
@@ -755,7 +751,7 @@ mod tests {
     #[test]
     fn cancelled_search_returns_promptly() {
         let dir = fixture();
-        let (catalog, _) = Catalog::open_or_build(&[dir.clone()], 100, true).unwrap();
+        let (catalog, _) = Catalog::open_or_build(std::slice::from_ref(&dir), 100, true).unwrap();
         let mut checks = 0usize;
         let result = catalog.search_with_cancel("a", 10, || {
             checks += 1;
@@ -771,7 +767,7 @@ mod tests {
     fn repetitive_typo_falls_back_safely() {
         let dir = fixture();
         fs::write(dir.join("folder").join("aaaaaab.log"), "test").unwrap();
-        let (catalog, _) = Catalog::open_or_build(&[dir.clone()], 1000, true).unwrap();
+        let (catalog, _) = Catalog::open_or_build(std::slice::from_ref(&dir), 1000, true).unwrap();
         assert!(catalog.accelerated());
         assert!(catalog.search("aaaaaac", 20)
             .iter().any(|p| p.ends_with("aaaaaab.log")));
@@ -783,7 +779,7 @@ mod tests {
     fn unicode_typo_is_not_lost_by_trigrams() {
         let dir = fixture();
         fs::write(dir.join("folder").join("Kittenzz.txt"), "test").unwrap();
-        let (catalog, _) = Catalog::open_or_build(&[dir.clone()], 1000, true).unwrap();
+        let (catalog, _) = Catalog::open_or_build(std::slice::from_ref(&dir), 1000, true).unwrap();
         assert!(catalog.search("kittenxz", 20)
             .iter().any(|p| p.ends_with("Kittenzz.txt")));
         drop(catalog);
@@ -792,7 +788,7 @@ mod tests {
 
     #[test]
     fn index_copy_is_cancellable() {
-        let mut progress = IndexProgress::default();
+        let progress = IndexProgress::default();
         let mut contents = Vec::new();
         let mut source = std::io::Cursor::new(vec![42u8; 200_000]);
         copy_with_cancel(&mut source, &mut contents, &progress).unwrap();
@@ -805,7 +801,7 @@ mod tests {
     #[test]
     fn cancelling_lookup_preparation_keeps_catalog() {
         let dir = fixture();
-        let roots = normalize_roots(&[dir.clone()]).unwrap();
+        let roots = normalize_roots(std::slice::from_ref(&dir)).unwrap();
         let file = dir.join("lookup-cancel.idx");
         Catalog::build_to_path(&roots, &file, 100, &IndexProgress::default()).unwrap();
         let progress = IndexProgress::default();
